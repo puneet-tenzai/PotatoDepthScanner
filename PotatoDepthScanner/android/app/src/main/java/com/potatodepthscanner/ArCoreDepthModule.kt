@@ -1,6 +1,7 @@
 package com.potatodepthscanner
 
 import android.app.Activity
+import android.content.Context
 import android.util.Log
 import com.facebook.react.bridge.*
 import com.facebook.react.modules.core.DeviceEventManagerModule
@@ -26,13 +27,13 @@ class ArCoreDepthModule(reactContext: ReactApplicationContext) :
     @ReactMethod
     fun checkDepthSupport(promise: Promise) {
         try {
-            val activity = currentActivity
+            val activity: Activity? = reactApplicationContext.currentActivity
             if (activity == null) {
                 promise.resolve(false)
                 return
             }
 
-            val availability = ArCoreApk.getInstance().checkAvailability(activity)
+            val availability = ArCoreApk.getInstance().checkAvailability(activity as Context)
             if (availability.isTransient) {
                 // Re-query at a later time
                 promise.resolve(false)
@@ -46,7 +47,7 @@ class ArCoreDepthModule(reactContext: ReactApplicationContext) :
 
             // Check if depth is supported by creating a temporary session
             try {
-                val tempSession = Session(activity, EnumSet.of(Session.Feature.FRONT_CAMERA).let {
+                val tempSession = Session(activity as Context, EnumSet.of(Session.Feature.FRONT_CAMERA).let {
                     EnumSet.noneOf(Session.Feature::class.java)
                 })
                 val config = Config(tempSession)
@@ -67,21 +68,21 @@ class ArCoreDepthModule(reactContext: ReactApplicationContext) :
     @ReactMethod
     fun startDepthSession(promise: Promise) {
         try {
-            val activity = currentActivity
+            val activity: Activity? = reactApplicationContext.currentActivity
             if (activity == null) {
                 promise.reject("NO_ACTIVITY", "No current activity")
                 return
             }
 
             // Install ARCore if needed
-            val installStatus = ArCoreApk.getInstance().requestInstall(activity, true)
+            val installStatus = ArCoreApk.getInstance().requestInstall(activity as Activity, true)
             if (installStatus == ArCoreApk.InstallStatus.INSTALL_REQUESTED) {
                 promise.reject("INSTALL_REQUESTED", "ARCore installation requested")
                 return
             }
 
             // Create and configure session
-            arSession = Session(activity)
+            arSession = Session(activity as Context)
             val config = Config(arSession)
             config.depthMode = Config.DepthMode.AUTOMATIC
             config.updateMode = Config.UpdateMode.LATEST_CAMERA_IMAGE
