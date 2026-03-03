@@ -1,5 +1,5 @@
 import React from 'react';
-import { View, Text, StyleSheet, Animated } from 'react-native';
+import { View, Text, StyleSheet } from 'react-native';
 import type { DepthData } from '../modules/DepthModule';
 
 interface DepthOverlayProps {
@@ -40,7 +40,7 @@ export const DepthOverlay: React.FC<DepthOverlayProps> = ({
 
     return (
         <View style={styles.container} pointerEvents="none">
-            {/* Status bar */}
+            {/* Error banner */}
             {error && (
                 <View style={styles.errorBanner}>
                     <Text style={styles.errorText}>⚠️ {error}</Text>
@@ -55,6 +55,13 @@ export const DepthOverlay: React.FC<DepthOverlayProps> = ({
                 </View>
             )}
 
+            {/* Camera paused notice */}
+            <View style={styles.cameraPausedBanner}>
+                <Text style={styles.cameraPausedText}>
+                    📡 ARCore is using the camera for depth sensing
+                </Text>
+            </View>
+
             {/* Center crosshair */}
             <View style={styles.crosshairContainer}>
                 <View style={[styles.crosshairCircle, { borderColor: color }]}>
@@ -63,7 +70,7 @@ export const DepthOverlay: React.FC<DepthOverlayProps> = ({
 
                 {/* Distance info */}
                 <View style={[styles.distanceCard, { borderColor: color }]}>
-                    <Text style={styles.distanceLabel}>DISTANCE</Text>
+                    <Text style={styles.distanceLabel}>GROUND DISTANCE</Text>
                     <Text style={[styles.distanceValue, { color }]}>
                         {distance > 0 ? `${distance.toFixed(2)} m` : '-- m'}
                     </Text>
@@ -90,7 +97,7 @@ const styles = StyleSheet.create({
     },
     errorBanner: {
         position: 'absolute',
-        top: 60,
+        top: 100,
         left: 20,
         right: 20,
         backgroundColor: 'rgba(255, 23, 68, 0.85)',
@@ -102,6 +109,22 @@ const styles = StyleSheet.create({
     errorText: {
         color: '#FFFFFF',
         fontSize: 14,
+        fontWeight: '600',
+    },
+    cameraPausedBanner: {
+        position: 'absolute',
+        top: 60,
+        left: 20,
+        right: 20,
+        backgroundColor: 'rgba(108, 99, 255, 0.85)',
+        paddingVertical: 8,
+        paddingHorizontal: 16,
+        borderRadius: 12,
+        alignItems: 'center',
+    },
+    cameraPausedText: {
+        color: '#FFFFFF',
+        fontSize: 12,
         fontWeight: '600',
     },
     crosshairContainer: {

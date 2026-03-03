@@ -29,8 +29,19 @@ export const CameraScreen: React.FC = () => {
     const [isCapturing, setIsCapturing] = useState(false);
     const [capturedPhoto, setCapturedPhoto] = useState<PhotoFile | null>(null);
     const [isSaving, setIsSaving] = useState(false);
+    const [isCameraActive, setIsCameraActive] = useState(true);
 
-    const { depthData, isActive: isDepthActive, isSupported, error, toggleDepth } = useDepthData();
+    // Camera pause/resume callbacks for ARCore
+    const handleCameraPause = useCallback(() => {
+        setIsCameraActive(false);
+    }, []);
+
+    const handleCameraResume = useCallback(() => {
+        setIsCameraActive(true);
+    }, []);
+
+    const { depthData, isActive: isDepthActive, isSupported, error, toggleDepth } =
+        useDepthData(handleCameraPause, handleCameraResume);
 
     // Request camera permission on mount
     useEffect(() => {
@@ -42,6 +53,16 @@ export const CameraScreen: React.FC = () => {
     // Capture photo
     const handleCapture = useCallback(async () => {
         if (!cameraRef.current || isCapturing) return;
+
+        // Can't capture while depth is active (camera is paused)
+        if (isDepthActive) {
+            Alert.alert(
+                'Depth Active',
+                'Please turn off depth sensing before taking a photo.',
+                [{ text: 'OK' }],
+            );
+            return;
+        }
 
         try {
             setIsCapturing(true);
@@ -55,7 +76,7 @@ export const CameraScreen: React.FC = () => {
         } finally {
             setIsCapturing(false);
         }
-    }, [isCapturing]);
+    }, [isCapturing, isDepthActive]);
 
     // Save photo to gallery
     const handleSavePhoto = useCallback(async () => {
@@ -166,7 +187,7 @@ export const CameraScreen: React.FC = () => {
                 ref={cameraRef}
                 style={StyleSheet.absoluteFill}
                 device={device}
-                isActive={true}
+                isActive={isCameraActive}
                 photo={true}
             />
 

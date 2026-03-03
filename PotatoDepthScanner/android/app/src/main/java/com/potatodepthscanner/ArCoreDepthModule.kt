@@ -9,6 +9,8 @@ import com.google.ar.core.*
 import com.google.ar.core.exceptions.*
 import java.nio.ShortBuffer
 import java.util.EnumSet
+import kotlin.math.max
+import kotlin.math.min
 
 class ArCoreDepthModule(reactContext: ReactApplicationContext) :
     ReactContextBaseJavaModule(reactContext) {
@@ -16,6 +18,7 @@ class ArCoreDepthModule(reactContext: ReactApplicationContext) :
     companion object {
         const val NAME = "ArCoreDepthModule"
         const val TAG = "ArCoreDepth"
+        const val SAMPLE_RADIUS = 2 // 5x5 grid (2 pixels in each direction from center)
     }
 
     private var arSession: Session? = null
@@ -35,7 +38,6 @@ class ArCoreDepthModule(reactContext: ReactApplicationContext) :
 
             val availability = ArCoreApk.getInstance().checkAvailability(activity as Context)
             if (availability.isTransient) {
-                // Re-query at a later time
                 promise.resolve(false)
                 return
             }
@@ -47,11 +49,7 @@ class ArCoreDepthModule(reactContext: ReactApplicationContext) :
 
             // Check if depth is supported by creating a temporary session
             try {
-                val tempSession = Session(activity as Context, EnumSet.of(Session.Feature.FRONT_CAMERA).let {
-                    EnumSet.noneOf(Session.Feature::class.java)
-                })
-                val config = Config(tempSession)
-                config.depthMode = Config.DepthMode.AUTOMATIC
+                val tempSession = Session(activity as Context, EnumSet.noneOf(Session.Feature::class.java))
                 val supported = tempSession.isDepthModeSupported(Config.DepthMode.AUTOMATIC)
                 tempSession.close()
                 promise.resolve(supported)
@@ -93,6 +91,9 @@ class ArCoreDepthModule(reactContext: ReactApplicationContext) :
 
             // Start a background thread to poll depth data
             depthThread = Thread {
+                // Give ARCore a moment to initialize and acquire first frames
+                Thread.sleep(500)
+
                 while (isRunning) {
                     try {
                         val frame = arSession?.update()
@@ -102,30 +103,33 @@ class ArCoreDepthModule(reactContext: ReactApplicationContext) :
                                 val width = depthImage.width
                                 val height = depthImage.height
 
-                                // Get depth at center of image
-                                val centerX = width / 2
-                                val centerY = height / 2
+                                // Sample at bottom-center of the image (ground area)
+                                // Using 85% down the image to target the ground when
+                                // the phone is held at a normal angle
+                                val targetX = width / 2
+                                val targetY = (height * 0.85).toInt()
 
                                 val plane = depthImage.planes[0]
                                 val buffer: ShortBuffer = plane.buffer.asShortBuffer()
-                                val pixelStride = plane.pixelStride
                                 val rowStride = plane.rowStride
 
-                                // Calculate the index for the center pixel
-                                val index = (centerY * rowStride / 2) + centerX
-                                val depthMillimeters = buffer.get(index).toInt() and 0xFFFF
-                                val depthMeters = depthMillimeters / 1000.0
+                                // Average a grid of pixels around the target for stability
+                                val depthMeters = sampleAveragedDepth(
+                                    buffer, rowStride, width, height, targetX, targetY
+                                )
 
                                 depthImage.close()
 
-                                // Send event to React Native
-                                val params = Arguments.createMap().apply {
-                                    putDouble("distance", depthMeters)
-                                    putInt("depthWidth", width)
-                                    putInt("depthHeight", height)
-                                    putDouble("confidence", if (depthMillimeters > 0) 1.0 else 0.0)
+                                if (depthMeters > 0) {
+                                    // Send event to React Native
+                                    val params = Arguments.createMap().apply {
+                                        putDouble("distance", depthMeters)
+                                        putInt("depthWidth", width)
+                                        putInt("depthHeight", height)
+                                        putDouble("confidence", 1.0)
+                                    }
+                                    sendEvent("onDepthData", params)
                                 }
-                                sendEvent("onDepthData", params)
                             } catch (e: NotYetAvailableException) {
                                 // Depth data not ready yet, skip this frame
                             }
@@ -135,6 +139,11 @@ class ArCoreDepthModule(reactContext: ReactApplicationContext) :
                         break
                     } catch (e: Exception) {
                         Log.e(TAG, "Error reading depth", e)
+                        // Send error event to JS
+                        val errorParams = Arguments.createMap().apply {
+                            putString("error", e.message ?: "Unknown depth error")
+                        }
+                        sendEvent("onDepthError", errorParams)
                     }
                 }
             }
@@ -147,8 +156,48 @@ class ArCoreDepthModule(reactContext: ReactApplicationContext) :
             promise.reject("NOT_COMPATIBLE", "Device does not support ARCore")
         } catch (e: UnavailableSdkTooOldException) {
             promise.reject("SDK_TOO_OLD", "ARCore SDK is too old")
+        } catch (e: CameraNotAvailableException) {
+            promise.reject("CAMERA_BUSY", "Camera is not available. Please close other camera apps.")
         } catch (e: Exception) {
             promise.reject("ERROR", "Failed to start depth session: ${e.message}")
+        }
+    }
+
+    /**
+     * Sample a 5x5 grid of depth pixels around (centerX, centerY) and return
+     * the averaged depth in meters. Ignores zero (invalid) readings.
+     */
+    private fun sampleAveragedDepth(
+        buffer: ShortBuffer,
+        rowStride: Int,
+        width: Int,
+        height: Int,
+        centerX: Int,
+        centerY: Int
+    ): Double {
+        var totalDepth: Long = 0
+        var validCount = 0
+
+        for (dy in -SAMPLE_RADIUS..SAMPLE_RADIUS) {
+            for (dx in -SAMPLE_RADIUS..SAMPLE_RADIUS) {
+                val px = max(0, min(width - 1, centerX + dx))
+                val py = max(0, min(height - 1, centerY + dy))
+
+                val index = (py * rowStride / 2) + px
+                if (index >= 0 && index < buffer.limit()) {
+                    val depthMm = buffer.get(index).toInt() and 0xFFFF
+                    if (depthMm > 0 && depthMm < 10000) { // Valid range: 0-10 meters
+                        totalDepth += depthMm
+                        validCount++
+                    }
+                }
+            }
+        }
+
+        return if (validCount > 0) {
+            (totalDepth.toDouble() / validCount) / 1000.0
+        } else {
+            0.0
         }
     }
 

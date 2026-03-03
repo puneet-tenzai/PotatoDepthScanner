@@ -3,9 +3,9 @@ import {
   NativeEventEmitter,
   Platform,
 } from 'react-native';
-import {useState, useEffect, useCallback} from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 
-const {ArCoreDepthModule} = NativeModules;
+const { ArCoreDepthModule } = NativeModules;
 
 export interface DepthData {
   distance: number;
@@ -49,13 +49,30 @@ export async function stopDepthSession(): Promise<boolean> {
 }
 
 /**
- * React hook for subscribing to depth data
+ * Delay helper
  */
-export function useDepthData() {
+function delay(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+/**
+ * React hook for subscribing to depth data.
+ *
+ * Accepts callbacks to pause/resume the Vision Camera, since ARCore and
+ * Vision Camera cannot use the back camera simultaneously.
+ *
+ * @param onCameraPause  Called BEFORE ARCore starts (release the camera)
+ * @param onCameraResume Called AFTER ARCore stops (re-acquire the camera)
+ */
+export function useDepthData(
+  onCameraPause?: () => void,
+  onCameraResume?: () => void,
+) {
   const [depthData, setDepthData] = useState<DepthData | null>(null);
   const [isActive, setIsActive] = useState(false);
   const [isSupported, setIsSupported] = useState<boolean | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const isTogglingRef = useRef(false);
 
   // Check support on mount
   useEffect(() => {
@@ -69,31 +86,56 @@ export function useDepthData() {
     }
 
     const eventEmitter = new NativeEventEmitter(ArCoreDepthModule);
-    const subscription = eventEmitter.addListener('onDepthData', (data: DepthData) => {
+
+    const depthSub = eventEmitter.addListener('onDepthData', (data: DepthData) => {
       setDepthData(data);
     });
 
+    const errorSub = eventEmitter.addListener('onDepthError', (data: { error: string }) => {
+      setError(data.error);
+    });
+
     return () => {
-      subscription.remove();
+      depthSub.remove();
+      errorSub.remove();
     };
   }, [isActive]);
 
   const toggleDepth = useCallback(async () => {
+    // Prevent double-toggling
+    if (isTogglingRef.current) return;
+    isTogglingRef.current = true;
+
     try {
       setError(null);
       if (isActive) {
+        // Stop ARCore first, then resume camera
         await stopDepthSession();
         setIsActive(false);
         setDepthData(null);
+
+        // Small delay before resuming camera
+        await delay(200);
+        onCameraResume?.();
       } else {
+        // Pause camera first, then start ARCore
+        onCameraPause?.();
+
+        // Wait for camera hardware to be fully released
+        await delay(500);
+
         await startDepthSession();
         setIsActive(true);
       }
     } catch (e: any) {
       setError(e.message || 'Failed to toggle depth');
       setIsActive(false);
+      // Resume camera if ARCore failed to start
+      onCameraResume?.();
+    } finally {
+      isTogglingRef.current = false;
     }
-  }, [isActive]);
+  }, [isActive, onCameraPause, onCameraResume]);
 
   return {
     depthData,
