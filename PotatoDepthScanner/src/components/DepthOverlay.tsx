@@ -43,7 +43,7 @@ export const DepthOverlay: React.FC<DepthOverlayProps> = ({
             {/* Info banner */}
             <View style={styles.infoBanner}>
                 <Text style={styles.infoText}>
-                    📡 Point your phone at the ground for distance measurement
+                    📡 ARCore Depth Mode — Point at the ground
                 </Text>
             </View>
 

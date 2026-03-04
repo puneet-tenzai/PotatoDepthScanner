@@ -19,6 +19,7 @@ import {
 import { CameraRoll } from '@react-native-camera-roll/camera-roll';
 import { DepthOverlay } from '../components/DepthOverlay';
 import { CaptureButton } from '../components/CaptureButton';
+import { ArCoreDepthViewComponent } from '../components/ArCoreDepthViewComponent';
 import { useDepthData } from '../modules/DepthModule';
 
 export const CameraScreen: React.FC = () => {
@@ -29,19 +30,8 @@ export const CameraScreen: React.FC = () => {
     const [isCapturing, setIsCapturing] = useState(false);
     const [capturedPhoto, setCapturedPhoto] = useState<PhotoFile | null>(null);
     const [isSaving, setIsSaving] = useState(false);
-    const [isCameraActive, setIsCameraActive] = useState(true);
 
-    // Camera pause/resume callbacks for ARCore
-    const handleCameraPause = useCallback(() => {
-        setIsCameraActive(false);
-    }, []);
-
-    const handleCameraResume = useCallback(() => {
-        setIsCameraActive(true);
-    }, []);
-
-    const { depthData, isActive: isDepthActive, isSupported, error, toggleDepth } =
-        useDepthData(handleCameraPause, handleCameraResume);
+    const { depthData, isActive: isDepthActive, isSupported, error, toggleDepth } = useDepthData();
 
     // Request camera permission on mount
     useEffect(() => {
@@ -54,7 +44,6 @@ export const CameraScreen: React.FC = () => {
     const handleCapture = useCallback(async () => {
         if (!cameraRef.current || isCapturing) return;
 
-        // Can't capture while depth is active (camera is paused)
         if (isDepthActive) {
             Alert.alert(
                 'Depth Active',
@@ -149,7 +138,6 @@ export const CameraScreen: React.FC = () => {
                     resizeMode="contain"
                 />
 
-                {/* Depth info at time of capture */}
                 {depthData && depthData.distance > 0 && (
                     <View style={styles.previewDepthBadge}>
                         <Text style={styles.previewDepthText}>
@@ -183,13 +171,24 @@ export const CameraScreen: React.FC = () => {
         <View style={styles.container}>
             <StatusBar barStyle="light-content" backgroundColor="transparent" translucent />
 
-            <Camera
-                ref={cameraRef}
-                style={StyleSheet.absoluteFill}
-                device={device}
-                isActive={isCameraActive}
-                photo={true}
-            />
+            {/* Vision Camera — visible when depth is OFF */}
+            {!isDepthActive && (
+                <Camera
+                    ref={cameraRef}
+                    style={StyleSheet.absoluteFill}
+                    device={device}
+                    isActive={true}
+                    photo={true}
+                />
+            )}
+
+            {/* ARCore Depth View — visible when depth is ON */}
+            {isDepthActive && (
+                <ArCoreDepthViewComponent
+                    style={StyleSheet.absoluteFill}
+                    isActive={true}
+                />
+            )}
 
             {/* Depth overlay */}
             <DepthOverlay
@@ -221,7 +220,6 @@ const styles = StyleSheet.create({
         flex: 1,
         backgroundColor: '#000000',
     },
-    // Permission screen
     permissionContainer: {
         flex: 1,
         backgroundColor: '#0D0D0D',
@@ -268,7 +266,6 @@ const styles = StyleSheet.create({
         fontSize: 14,
         fontWeight: '600',
     },
-    // Top bar
     topBar: {
         position: 'absolute',
         top: 0,
@@ -285,7 +282,6 @@ const styles = StyleSheet.create({
         fontWeight: '800',
         letterSpacing: 0.5,
     },
-    // Preview screen
     previewContainer: {
         flex: 1,
         backgroundColor: '#0D0D0D',
