@@ -122,7 +122,8 @@ export function useDepthData(
         onCameraPause?.();
 
         // Wait for camera hardware to be fully released
-        await delay(500);
+        // Vision Camera needs time to close the camera device
+        await delay(1500);
 
         await startDepthSession();
         setIsActive(true);

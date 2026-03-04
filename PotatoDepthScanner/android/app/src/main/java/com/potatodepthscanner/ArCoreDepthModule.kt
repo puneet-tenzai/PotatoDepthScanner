@@ -2,13 +2,13 @@ package com.potatodepthscanner
 
 import android.app.Activity
 import android.content.Context
+import android.media.Image
 import android.util.Log
 import com.facebook.react.bridge.*
 import com.facebook.react.modules.core.DeviceEventManagerModule
 import com.google.ar.core.*
 import com.google.ar.core.exceptions.*
 import java.nio.ShortBuffer
-import java.util.EnumSet
 import kotlin.math.max
 import kotlin.math.min
 
@@ -18,7 +18,7 @@ class ArCoreDepthModule(reactContext: ReactApplicationContext) :
     companion object {
         const val NAME = "ArCoreDepthModule"
         const val TAG = "ArCoreDepth"
-        const val SAMPLE_RADIUS = 2 // 5x5 grid (2 pixels in each direction from center)
+        const val SAMPLE_RADIUS = 2 // 5x5 grid
     }
 
     private var arSession: Session? = null
@@ -47,9 +47,8 @@ class ArCoreDepthModule(reactContext: ReactApplicationContext) :
                 return
             }
 
-            // Check if depth is supported by creating a temporary session
             try {
-                val tempSession = Session(activity as Context, EnumSet.noneOf(Session.Feature::class.java))
+                val tempSession = Session(activity as Context)
                 val supported = tempSession.isDepthModeSupported(Config.DepthMode.AUTOMATIC)
                 tempSession.close()
                 promise.resolve(supported)
@@ -79,87 +78,137 @@ class ArCoreDepthModule(reactContext: ReactApplicationContext) :
                 return
             }
 
+            Log.d(TAG, "Creating ARCore session...")
+
             // Create and configure session
             arSession = Session(activity as Context)
-            val config = Config(arSession)
+            val config = Config(arSession!!)
             config.depthMode = Config.DepthMode.AUTOMATIC
             config.updateMode = Config.UpdateMode.LATEST_CAMERA_IMAGE
-            arSession?.configure(config)
-            arSession?.resume()
+            arSession!!.configure(config)
+
+            Log.d(TAG, "Resuming ARCore session...")
+            arSession!!.resume()
+            Log.d(TAG, "ARCore session started successfully")
 
             isRunning = true
 
-            // Start a background thread to poll depth data
+            // Start background thread to poll depth data
             depthThread = Thread {
-                // Give ARCore a moment to initialize and acquire first frames
-                Thread.sleep(500)
+                Log.d(TAG, "Depth thread started, waiting for initialization...")
+                // Give ARCore time to initialize and acquire first frames
+                Thread.sleep(1500)
+                Log.d(TAG, "Initialization wait complete, starting depth polling")
+
+                var frameCount = 0
+                var errorCount = 0
 
                 while (isRunning) {
                     try {
-                        val frame = arSession?.update()
-                        if (frame != null) {
-                            try {
-                                val depthImage = frame.acquireDepthImage16Bits()
-                                val width = depthImage.width
-                                val height = depthImage.height
+                        val session = arSession ?: break
+                        val frame = session.update()
 
-                                // Sample at bottom-center of the image (ground area)
-                                // Using 85% down the image to target the ground when
-                                // the phone is held at a normal angle
-                                val targetX = width / 2
-                                val targetY = (height * 0.85).toInt()
+                        frameCount++
 
-                                val plane = depthImage.planes[0]
-                                val buffer: ShortBuffer = plane.buffer.asShortBuffer()
-                                val rowStride = plane.rowStride
-
-                                // Average a grid of pixels around the target for stability
-                                val depthMeters = sampleAveragedDepth(
-                                    buffer, rowStride, width, height, targetX, targetY
-                                )
-
-                                depthImage.close()
-
-                                if (depthMeters > 0) {
-                                    // Send event to React Native
-                                    val params = Arguments.createMap().apply {
-                                        putDouble("distance", depthMeters)
-                                        putInt("depthWidth", width)
-                                        putInt("depthHeight", height)
-                                        putDouble("confidence", 1.0)
-                                    }
-                                    sendEvent("onDepthData", params)
-                                }
-                            } catch (e: NotYetAvailableException) {
-                                // Depth data not ready yet, skip this frame
+                        // Check tracking state
+                        val camera = frame.camera
+                        if (camera.trackingState != TrackingState.TRACKING) {
+                            if (frameCount % 10 == 0) {
+                                Log.d(TAG, "Frame $frameCount: Not tracking yet (state: ${camera.trackingState})")
                             }
+                            Thread.sleep(100)
+                            continue
                         }
-                        Thread.sleep(100) // ~10 FPS for depth data
+
+                        // Try to acquire depth image
+                        var depthImage: Image? = null
+                        try {
+                            depthImage = frame.acquireDepthImage()
+
+                            val width = depthImage.width
+                            val height = depthImage.height
+
+                            Log.d(TAG, "Frame $frameCount: Got depth image ${width}x${height}")
+
+                            // Sample at bottom-center for ground distance
+                            val targetX = width / 2
+                            val targetY = (height * 0.85).toInt()
+
+                            val plane = depthImage.planes[0]
+                            val buffer: ShortBuffer = plane.buffer.asShortBuffer()
+                            val rowStride = plane.rowStride
+
+                            val depthMeters = sampleAveragedDepth(
+                                buffer, rowStride, width, height, targetX, targetY
+                            )
+
+                            if (depthMeters > 0) {
+                                val params = Arguments.createMap().apply {
+                                    putDouble("distance", depthMeters)
+                                    putInt("depthWidth", width)
+                                    putInt("depthHeight", height)
+                                    putDouble("confidence", 1.0)
+                                }
+                                sendEvent("onDepthData", params)
+                                errorCount = 0 // Reset error count on success
+                            }
+                        } catch (e: NotYetAvailableException) {
+                            // Depth data not ready yet — this is normal for the first few frames
+                            if (frameCount % 20 == 0) {
+                                Log.d(TAG, "Frame $frameCount: Depth not yet available")
+                            }
+                        } finally {
+                            depthImage?.close()
+                        }
+
+                        Thread.sleep(100) // ~10 FPS
                     } catch (e: InterruptedException) {
+                        Log.d(TAG, "Depth thread interrupted")
                         break
                     } catch (e: Exception) {
-                        Log.e(TAG, "Error reading depth", e)
-                        // Send error event to JS
-                        val errorParams = Arguments.createMap().apply {
-                            putString("error", e.message ?: "Unknown depth error")
+                        errorCount++
+                        val errorMsg = "${e.javaClass.simpleName}: ${e.message ?: "no details"}"
+                        Log.e(TAG, "Depth read error ($errorCount): $errorMsg", e)
+
+                        // Only send error to JS every 5th error to avoid spam
+                        if (errorCount <= 3 || errorCount % 5 == 0) {
+                            val errorParams = Arguments.createMap().apply {
+                                putString("error", errorMsg)
+                            }
+                            sendEvent("onDepthError", errorParams)
                         }
-                        sendEvent("onDepthError", errorParams)
+
+                        // If too many consecutive errors, stop
+                        if (errorCount >= 30) {
+                            Log.e(TAG, "Too many consecutive errors, stopping depth")
+                            break
+                        }
+
+                        Thread.sleep(200)
                     }
                 }
+
+                Log.d(TAG, "Depth thread ended (frames: $frameCount, errors: $errorCount)")
             }
             depthThread?.start()
 
             promise.resolve(true)
         } catch (e: UnavailableArcoreNotInstalledException) {
+            Log.e(TAG, "ARCore not installed", e)
             promise.reject("NOT_INSTALLED", "ARCore is not installed")
         } catch (e: UnavailableDeviceNotCompatibleException) {
+            Log.e(TAG, "Device not compatible", e)
             promise.reject("NOT_COMPATIBLE", "Device does not support ARCore")
         } catch (e: UnavailableSdkTooOldException) {
+            Log.e(TAG, "SDK too old", e)
             promise.reject("SDK_TOO_OLD", "ARCore SDK is too old")
         } catch (e: CameraNotAvailableException) {
-            promise.reject("CAMERA_BUSY", "Camera is not available. Please close other camera apps.")
+            Log.e(TAG, "Camera not available", e)
+            promise.reject("CAMERA_BUSY", "Camera is in use. Please wait a moment and try again.")
         } catch (e: Exception) {
-            promise.reject("ERROR", "Failed to start depth session: ${e.message}")
+            val errorMsg = "${e.javaClass.simpleName}: ${e.message ?: "no details"}"
+            Log.e(TAG, "Failed to start depth: $errorMsg", e)
+            promise.reject("ERROR", "Failed to start: $errorMsg")
         }
     }
 
@@ -186,7 +235,7 @@ class ArCoreDepthModule(reactContext: ReactApplicationContext) :
                 val index = (py * rowStride / 2) + px
                 if (index >= 0 && index < buffer.limit()) {
                     val depthMm = buffer.get(index).toInt() and 0xFFFF
-                    if (depthMm > 0 && depthMm < 10000) { // Valid range: 0-10 meters
+                    if (depthMm > 0 && depthMm < 10000) {
                         totalDepth += depthMm
                         validCount++
                     }
@@ -204,22 +253,29 @@ class ArCoreDepthModule(reactContext: ReactApplicationContext) :
     @ReactMethod
     fun stopDepthSession(promise: Promise) {
         try {
+            Log.d(TAG, "Stopping depth session...")
             isRunning = false
             depthThread?.interrupt()
             depthThread = null
             arSession?.pause()
             arSession?.close()
             arSession = null
+            Log.d(TAG, "Depth session stopped")
             promise.resolve(true)
         } catch (e: Exception) {
+            Log.e(TAG, "Error stopping depth session", e)
             promise.reject("ERROR", "Failed to stop depth session: ${e.message}")
         }
     }
 
     private fun sendEvent(eventName: String, params: WritableMap) {
-        reactApplicationContext
-            .getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter::class.java)
-            .emit(eventName, params)
+        try {
+            reactApplicationContext
+                .getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter::class.java)
+                .emit(eventName, params)
+        } catch (e: Exception) {
+            Log.e(TAG, "Error sending event $eventName", e)
+        }
     }
 
     @ReactMethod
