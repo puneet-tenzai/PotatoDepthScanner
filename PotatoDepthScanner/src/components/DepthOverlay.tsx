@@ -11,15 +11,15 @@ interface DepthOverlayProps {
 
 const getDistanceColor = (distance: number): string => {
     if (distance <= 0) return '#888888';
-    if (distance < 0.5) return '#00E676'; // Bright green - very close
-    if (distance < 1.0) return '#76FF03'; // Light green
-    if (distance < 2.0) return '#FFEA00'; // Yellow
-    if (distance < 3.0) return '#FF9100'; // Orange
-    return '#FF1744'; // Red - far
+    if (distance < 0.5) return '#00E676';
+    if (distance < 1.0) return '#76FF03';
+    if (distance < 2.0) return '#FFEA00';
+    if (distance < 3.0) return '#FF9100';
+    return '#FF1744';
 };
 
 const getDistanceLabel = (distance: number): string => {
-    if (distance <= 0) return 'Measuring...';
+    if (distance <= 0) return 'Initializing...';
     if (distance < 0.3) return 'Very Close';
     if (distance < 1.0) return 'Close';
     if (distance < 2.0) return 'Medium';
@@ -40,6 +40,13 @@ export const DepthOverlay: React.FC<DepthOverlayProps> = ({
 
     return (
         <View style={styles.container} pointerEvents="none">
+            {/* Info banner */}
+            <View style={styles.infoBanner}>
+                <Text style={styles.infoText}>
+                    📡 Point your phone at the ground for distance measurement
+                </Text>
+            </View>
+
             {/* Error banner */}
             {error && (
                 <View style={styles.errorBanner}>
@@ -55,20 +62,13 @@ export const DepthOverlay: React.FC<DepthOverlayProps> = ({
                 </View>
             )}
 
-            {/* Camera paused notice */}
-            <View style={styles.cameraPausedBanner}>
-                <Text style={styles.cameraPausedText}>
-                    📡 ARCore is using the camera for depth sensing
-                </Text>
-            </View>
-
             {/* Center crosshair */}
             <View style={styles.crosshairContainer}>
                 <View style={[styles.crosshairCircle, { borderColor: color }]}>
                     <View style={[styles.crosshairDot, { backgroundColor: color }]} />
                 </View>
 
-                {/* Distance info */}
+                {/* Distance card */}
                 <View style={[styles.distanceCard, { borderColor: color }]}>
                     <Text style={styles.distanceLabel}>GROUND DISTANCE</Text>
                     <Text style={[styles.distanceValue, { color }]}>
@@ -77,6 +77,11 @@ export const DepthOverlay: React.FC<DepthOverlayProps> = ({
                     <Text style={[styles.distanceCategory, { color }]}>
                         {getDistanceLabel(distance)}
                     </Text>
+                    {distance > 0 && (
+                        <Text style={styles.distanceFeet}>
+                            ≈ {(distance * 3.281).toFixed(1)} ft
+                        </Text>
+                    )}
                 </View>
             </View>
 
@@ -95,6 +100,22 @@ const styles = StyleSheet.create({
         justifyContent: 'center',
         alignItems: 'center',
     },
+    infoBanner: {
+        position: 'absolute',
+        top: 60,
+        left: 20,
+        right: 20,
+        backgroundColor: 'rgba(108, 99, 255, 0.85)',
+        paddingVertical: 8,
+        paddingHorizontal: 16,
+        borderRadius: 12,
+        alignItems: 'center',
+    },
+    infoText: {
+        color: '#FFFFFF',
+        fontSize: 12,
+        fontWeight: '600',
+    },
     errorBanner: {
         position: 'absolute',
         top: 100,
@@ -109,22 +130,6 @@ const styles = StyleSheet.create({
     errorText: {
         color: '#FFFFFF',
         fontSize: 14,
-        fontWeight: '600',
-    },
-    cameraPausedBanner: {
-        position: 'absolute',
-        top: 60,
-        left: 20,
-        right: 20,
-        backgroundColor: 'rgba(108, 99, 255, 0.85)',
-        paddingVertical: 8,
-        paddingHorizontal: 16,
-        borderRadius: 12,
-        alignItems: 'center',
-    },
-    cameraPausedText: {
-        color: '#FFFFFF',
-        fontSize: 12,
         fontWeight: '600',
     },
     crosshairContainer: {
@@ -152,7 +157,7 @@ const styles = StyleSheet.create({
         borderRadius: 16,
         borderWidth: 1,
         alignItems: 'center',
-        minWidth: 160,
+        minWidth: 180,
     },
     distanceLabel: {
         color: '#AAAAAA',
@@ -172,6 +177,12 @@ const styles = StyleSheet.create({
         marginTop: 2,
         textTransform: 'uppercase',
         letterSpacing: 1,
+    },
+    distanceFeet: {
+        color: '#999999',
+        fontSize: 12,
+        fontWeight: '500',
+        marginTop: 4,
     },
     activeIndicator: {
         position: 'absolute',

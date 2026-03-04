@@ -8,7 +8,8 @@ import { useState, useEffect, useCallback, useRef } from 'react';
 const { ArCoreDepthModule } = NativeModules;
 
 export interface DepthData {
-  distance: number;
+  distance: number; // smoothed distance in meters
+  rawDistance: number; // raw unsmoothed distance
   depthWidth: number;
   depthHeight: number;
   confidence: number;

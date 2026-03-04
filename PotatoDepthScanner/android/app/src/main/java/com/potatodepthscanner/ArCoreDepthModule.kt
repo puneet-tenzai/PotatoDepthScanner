@@ -24,14 +24,16 @@ class ArCoreDepthModule(reactContext: ReactApplicationContext) :
     companion object {
         const val NAME = "ArCoreDepthModule"
         const val TAG = "ArCoreDepth"
-        const val SAMPLE_RADIUS = 2
+        const val SAMPLE_RADIUS = 3 // 7x7 grid for better averaging
+        const val SMOOTHING_FACTOR = 0.3 // Exponential moving average (lower = smoother)
     }
 
     private var arSession: Session? = null
     private var isRunning = false
     private var depthThread: Thread? = null
+    private var smoothedDepth: Double = 0.0
 
-    // EGL resources for offscreen GL context
+    // EGL resources
     private var eglDisplay: EGLDisplay? = null
     private var eglContext: EGLContext? = null
     private var eglSurface: EGLSurface? = null
@@ -39,12 +41,7 @@ class ArCoreDepthModule(reactContext: ReactApplicationContext) :
 
     override fun getName(): String = NAME
 
-    /**
-     * Creates a minimal offscreen EGL context so ARCore can use OpenGL.
-     * ARCore requires a valid GL context for session.update() and depth acquisition.
-     */
     private fun createEglContext() {
-        // 1. Get default display
         eglDisplay = EGL14.eglGetDisplay(EGL14.EGL_DEFAULT_DISPLAY)
         if (eglDisplay == EGL14.EGL_NO_DISPLAY) {
             throw RuntimeException("Unable to get EGL14 display")
@@ -55,7 +52,6 @@ class ArCoreDepthModule(reactContext: ReactApplicationContext) :
             throw RuntimeException("Unable to initialize EGL14")
         }
 
-        // 2. Choose config
         val configAttribs = intArrayOf(
             EGL14.EGL_RED_SIZE, 8,
             EGL14.EGL_GREEN_SIZE, 8,
@@ -68,95 +64,47 @@ class ArCoreDepthModule(reactContext: ReactApplicationContext) :
         val configs = arrayOfNulls<EGLConfig>(1)
         val numConfigs = IntArray(1)
         EGL14.eglChooseConfig(eglDisplay, configAttribs, 0, configs, 0, 1, numConfigs, 0)
+        if (numConfigs[0] == 0) throw RuntimeException("No suitable EGLConfig")
 
-        if (numConfigs[0] == 0) {
-            throw RuntimeException("Unable to find a suitable EGLConfig")
-        }
+        val contextAttribs = intArrayOf(EGL14.EGL_CONTEXT_CLIENT_VERSION, 2, EGL14.EGL_NONE)
+        eglContext = EGL14.eglCreateContext(eglDisplay, configs[0]!!, EGL14.EGL_NO_CONTEXT, contextAttribs, 0)
+        if (eglContext == EGL14.EGL_NO_CONTEXT) throw RuntimeException("Unable to create EGL context")
 
-        val eglConfig = configs[0]!!
+        val surfaceAttribs = intArrayOf(EGL14.EGL_WIDTH, 1, EGL14.EGL_HEIGHT, 1, EGL14.EGL_NONE)
+        eglSurface = EGL14.eglCreatePbufferSurface(eglDisplay, configs[0]!!, surfaceAttribs, 0)
 
-        // 3. Create context
-        val contextAttribs = intArrayOf(
-            EGL14.EGL_CONTEXT_CLIENT_VERSION, 2,
-            EGL14.EGL_NONE
-        )
-        eglContext = EGL14.eglCreateContext(eglDisplay, eglConfig, EGL14.EGL_NO_CONTEXT, contextAttribs, 0)
-        if (eglContext == EGL14.EGL_NO_CONTEXT) {
-            throw RuntimeException("Unable to create EGL context")
-        }
-
-        // 4. Create 1x1 pbuffer surface (offscreen)
-        val surfaceAttribs = intArrayOf(
-            EGL14.EGL_WIDTH, 1,
-            EGL14.EGL_HEIGHT, 1,
-            EGL14.EGL_NONE
-        )
-        eglSurface = EGL14.eglCreatePbufferSurface(eglDisplay, eglConfig, surfaceAttribs, 0)
-        if (eglSurface == EGL14.EGL_NO_SURFACE) {
-            throw RuntimeException("Unable to create EGL surface")
-        }
-
-        // 5. Make current
         if (!EGL14.eglMakeCurrent(eglDisplay, eglSurface, eglSurface, eglContext)) {
             throw RuntimeException("Unable to make EGL context current")
         }
 
-        // 6. Create a GL texture for ARCore camera
         val textures = IntArray(1)
         GLES20.glGenTextures(1, textures, 0)
         cameraTextureId = textures[0]
-
-        Log.d(TAG, "EGL context created, camera texture ID: $cameraTextureId")
+        Log.d(TAG, "EGL context created, texture: $cameraTextureId")
     }
 
-    /**
-     * Clean up EGL resources
-     */
     private fun destroyEglContext() {
         if (cameraTextureId != -1) {
-            // Can only delete if context is current
-            try {
-                GLES20.glDeleteTextures(1, intArrayOf(cameraTextureId), 0)
-            } catch (e: Exception) {
-                Log.w(TAG, "Failed to delete GL texture", e)
-            }
+            try { GLES20.glDeleteTextures(1, intArrayOf(cameraTextureId), 0) } catch (_: Exception) {}
             cameraTextureId = -1
         }
         if (eglDisplay != null && eglDisplay != EGL14.EGL_NO_DISPLAY) {
             EGL14.eglMakeCurrent(eglDisplay, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_CONTEXT)
-            if (eglSurface != null && eglSurface != EGL14.EGL_NO_SURFACE) {
-                EGL14.eglDestroySurface(eglDisplay, eglSurface)
-            }
-            if (eglContext != null && eglContext != EGL14.EGL_NO_CONTEXT) {
-                EGL14.eglDestroyContext(eglDisplay, eglContext)
-            }
+            eglSurface?.let { EGL14.eglDestroySurface(eglDisplay, it) }
+            eglContext?.let { EGL14.eglDestroyContext(eglDisplay, it) }
             EGL14.eglTerminate(eglDisplay)
         }
-        eglDisplay = null
-        eglContext = null
-        eglSurface = null
-        Log.d(TAG, "EGL context destroyed")
+        eglDisplay = null; eglContext = null; eglSurface = null
     }
 
     @ReactMethod
     fun checkDepthSupport(promise: Promise) {
         try {
             val activity: Activity? = reactApplicationContext.currentActivity
-            if (activity == null) {
-                promise.resolve(false)
-                return
-            }
+            if (activity == null) { promise.resolve(false); return }
 
             val availability = ArCoreApk.getInstance().checkAvailability(activity as Context)
-            if (availability.isTransient) {
-                promise.resolve(false)
-                return
-            }
-
-            if (!availability.isSupported) {
-                promise.resolve(false)
-                return
-            }
+            if (availability.isTransient || !availability.isSupported) { promise.resolve(false); return }
 
             try {
                 val tempSession = Session(activity as Context)
@@ -168,7 +116,6 @@ class ArCoreDepthModule(reactContext: ReactApplicationContext) :
                 promise.resolve(false)
             }
         } catch (e: Exception) {
-            Log.e(TAG, "Error checking ARCore availability", e)
             promise.resolve(false)
         }
     }
@@ -177,18 +124,12 @@ class ArCoreDepthModule(reactContext: ReactApplicationContext) :
     fun startDepthSession(promise: Promise) {
         try {
             val activity: Activity? = reactApplicationContext.currentActivity
-            if (activity == null) {
-                promise.reject("NO_ACTIVITY", "No current activity")
-                return
-            }
+            if (activity == null) { promise.reject("NO_ACTIVITY", "No current activity"); return }
 
             val installStatus = ArCoreApk.getInstance().requestInstall(activity as Activity, true)
             if (installStatus == ArCoreApk.InstallStatus.INSTALL_REQUESTED) {
-                promise.reject("INSTALL_REQUESTED", "ARCore installation requested")
-                return
+                promise.reject("INSTALL_REQUESTED", "ARCore installation requested"); return
             }
-
-            Log.d(TAG, "Creating ARCore session...")
 
             arSession = Session(activity as Context)
             val config = Config(arSession!!)
@@ -197,27 +138,17 @@ class ArCoreDepthModule(reactContext: ReactApplicationContext) :
             arSession!!.configure(config)
 
             isRunning = true
+            smoothedDepth = 0.0
 
-            // Start depth thread — EGL context and session resume happen on this thread
             depthThread = Thread {
                 try {
-                    // Create EGL context on this thread (must be on the same thread that calls session.update)
-                    Log.d(TAG, "Creating EGL context on depth thread...")
                     createEglContext()
-
-                    // Set the camera texture name for ARCore
                     arSession!!.setCameraTextureName(cameraTextureId)
-
-                    // Resume session (camera opens here)
-                    Log.d(TAG, "Resuming ARCore session...")
                     arSession!!.resume()
-                    Log.d(TAG, "ARCore session resumed successfully")
 
-                    // Give ARCore time to acquire first frames and start tracking
                     Thread.sleep(2000)
 
                     var frameCount = 0
-                    var successCount = 0
 
                     while (isRunning) {
                         try {
@@ -225,109 +156,86 @@ class ArCoreDepthModule(reactContext: ReactApplicationContext) :
                             val frame = session.update()
                             frameCount++
 
-                            // Check tracking state
                             val camera = frame.camera
                             if (camera.trackingState != TrackingState.TRACKING) {
-                                if (frameCount % 20 == 0) {
-                                    Log.d(TAG, "Frame $frameCount: Tracking state = ${camera.trackingState}")
-                                }
                                 Thread.sleep(100)
                                 continue
                             }
 
-                            // Try to acquire depth image
                             var depthImage: Image? = null
                             try {
                                 depthImage = frame.acquireDepthImage()
-
                                 val width = depthImage.width
                                 val height = depthImage.height
 
-                                // Sample at bottom-center for ground distance
+                                // Sample from CENTER of the image
+                                // When pointing phone at ground, center = ground
                                 val targetX = width / 2
-                                val targetY = (height * 0.85).toInt()
+                                val targetY = height / 2
 
                                 val plane = depthImage.planes[0]
                                 val buffer: ShortBuffer = plane.buffer.asShortBuffer()
                                 val rowStride = plane.rowStride
 
-                                val depthMeters = sampleAveragedDepth(
+                                val rawDepth = sampleAveragedDepth(
                                     buffer, rowStride, width, height, targetX, targetY
                                 )
 
-                                if (depthMeters > 0) {
-                                    successCount++
+                                if (rawDepth > 0) {
+                                    // Apply exponential moving average for stability
+                                    smoothedDepth = if (smoothedDepth <= 0) {
+                                        rawDepth
+                                    } else {
+                                        smoothedDepth * (1 - SMOOTHING_FACTOR) + rawDepth * SMOOTHING_FACTOR
+                                    }
+
+                                    Log.d(TAG, "Frame $frameCount: raw=${String.format("%.3f", rawDepth)}m smoothed=${String.format("%.3f", smoothedDepth)}m (${width}x${height})")
+
                                     val params = Arguments.createMap().apply {
-                                        putDouble("distance", depthMeters)
+                                        putDouble("distance", smoothedDepth)
+                                        putDouble("rawDistance", rawDepth)
                                         putInt("depthWidth", width)
                                         putInt("depthHeight", height)
                                         putDouble("confidence", 1.0)
                                     }
                                     sendEvent("onDepthData", params)
                                 }
-                            } catch (e: NotYetAvailableException) {
-                                // Normal during first few seconds
-                                if (frameCount % 30 == 0) {
-                                    Log.d(TAG, "Frame $frameCount: Depth not yet available")
-                                }
+                            } catch (_: NotYetAvailableException) {
+                                // Normal for first few seconds
                             } finally {
                                 depthImage?.close()
                             }
 
-                            Thread.sleep(100) // ~10 FPS
-                        } catch (e: InterruptedException) {
-                            Log.d(TAG, "Depth thread interrupted")
-                            break
-                        } catch (e: Exception) {
-                            val errorMsg = "${e.javaClass.simpleName}: ${e.message ?: "no details"}"
-                            Log.e(TAG, "Depth error at frame $frameCount: $errorMsg", e)
-
-                            val errorParams = Arguments.createMap().apply {
-                                putString("error", errorMsg)
-                            }
-                            sendEvent("onDepthError", errorParams)
-
+                            Thread.sleep(150) // ~7 FPS — slightly slower for stability
+                        } catch (e: InterruptedException) { break }
+                        catch (e: Exception) {
+                            Log.e(TAG, "Depth error: ${e.javaClass.simpleName}: ${e.message}", e)
                             Thread.sleep(500)
                         }
                     }
-
-                    Log.d(TAG, "Depth loop ended (frames: $frameCount, successes: $successCount)")
-                } catch (e: InterruptedException) {
-                    Log.d(TAG, "Depth thread interrupted during setup")
                 } catch (e: CameraNotAvailableException) {
-                    Log.e(TAG, "Camera not available for ARCore", e)
-                    val errorParams = Arguments.createMap().apply {
-                        putString("error", "Camera not available. Close other camera apps and try again.")
-                    }
-                    sendEvent("onDepthError", errorParams)
+                    val p = Arguments.createMap().apply { putString("error", "Camera busy. Wait and retry.") }
+                    sendEvent("onDepthError", p)
                 } catch (e: Exception) {
-                    val errorMsg = "${e.javaClass.simpleName}: ${e.message ?: "no details"}"
-                    Log.e(TAG, "Depth thread fatal error: $errorMsg", e)
-                    val errorParams = Arguments.createMap().apply {
-                        putString("error", errorMsg)
-                    }
-                    sendEvent("onDepthError", errorParams)
+                    val p = Arguments.createMap().apply { putString("error", "${e.javaClass.simpleName}: ${e.message ?: "unknown"}") }
+                    sendEvent("onDepthError", p)
                 } finally {
-                    // Clean up EGL on this thread
                     destroyEglContext()
                 }
             }
             depthThread?.start()
-
             promise.resolve(true)
-        } catch (e: UnavailableArcoreNotInstalledException) {
-            promise.reject("NOT_INSTALLED", "ARCore is not installed")
-        } catch (e: UnavailableDeviceNotCompatibleException) {
-            promise.reject("NOT_COMPATIBLE", "Device does not support ARCore")
-        } catch (e: UnavailableSdkTooOldException) {
-            promise.reject("SDK_TOO_OLD", "ARCore SDK is too old")
-        } catch (e: Exception) {
-            val errorMsg = "${e.javaClass.simpleName}: ${e.message ?: "no details"}"
-            Log.e(TAG, "Failed to start depth: $errorMsg", e)
-            promise.reject("ERROR", "Failed to start: $errorMsg")
-        }
+
+        } catch (e: UnavailableArcoreNotInstalledException) { promise.reject("NOT_INSTALLED", "ARCore is not installed")
+        } catch (e: UnavailableDeviceNotCompatibleException) { promise.reject("NOT_COMPATIBLE", "Device not compatible")
+        } catch (e: UnavailableSdkTooOldException) { promise.reject("SDK_TOO_OLD", "ARCore SDK too old")
+        } catch (e: Exception) { promise.reject("ERROR", "${e.javaClass.simpleName}: ${e.message}") }
     }
 
+    /**
+     * Sample a 7x7 grid around the target point and return averaged depth in meters.
+     * Uses pixel stride from the image plane for correct indexing.
+     */
     private fun sampleAveragedDepth(
         buffer: ShortBuffer,
         rowStride: Int,
@@ -338,16 +246,17 @@ class ArCoreDepthModule(reactContext: ReactApplicationContext) :
     ): Double {
         var totalDepth: Long = 0
         var validCount = 0
+        val shortsPerRow = rowStride / 2 // rowStride is in bytes, shorts are 2 bytes
 
         for (dy in -SAMPLE_RADIUS..SAMPLE_RADIUS) {
             for (dx in -SAMPLE_RADIUS..SAMPLE_RADIUS) {
                 val px = max(0, min(width - 1, centerX + dx))
                 val py = max(0, min(height - 1, centerY + dy))
 
-                val index = (py * rowStride / 2) + px
+                val index = py * shortsPerRow + px
                 if (index >= 0 && index < buffer.limit()) {
                     val depthMm = buffer.get(index).toInt() and 0xFFFF
-                    if (depthMm > 0 && depthMm < 10000) {
+                    if (depthMm in 1..8000) { // Valid: 1mm to 8m
                         totalDepth += depthMm
                         validCount++
                     }
@@ -365,37 +274,27 @@ class ArCoreDepthModule(reactContext: ReactApplicationContext) :
     @ReactMethod
     fun stopDepthSession(promise: Promise) {
         try {
-            Log.d(TAG, "Stopping depth session...")
             isRunning = false
             depthThread?.interrupt()
-            depthThread?.join(3000) // Wait up to 3 seconds for thread to finish
+            depthThread?.join(3000)
             depthThread = null
-
             arSession?.pause()
             arSession?.close()
             arSession = null
-
-            Log.d(TAG, "Depth session stopped")
+            smoothedDepth = 0.0
             promise.resolve(true)
         } catch (e: Exception) {
-            Log.e(TAG, "Error stopping depth session", e)
-            promise.reject("ERROR", "Failed to stop depth session: ${e.message}")
+            promise.reject("ERROR", "Failed to stop: ${e.message}")
         }
     }
 
     private fun sendEvent(eventName: String, params: WritableMap) {
         try {
-            reactApplicationContext
-                .getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter::class.java)
+            reactApplicationContext.getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter::class.java)
                 .emit(eventName, params)
-        } catch (e: Exception) {
-            Log.e(TAG, "Error sending event $eventName", e)
-        }
+        } catch (_: Exception) {}
     }
 
-    @ReactMethod
-    fun addListener(eventName: String) {}
-
-    @ReactMethod
-    fun removeListeners(count: Int) {}
+    @ReactMethod fun addListener(eventName: String) {}
+    @ReactMethod fun removeListeners(count: Int) {}
 }
