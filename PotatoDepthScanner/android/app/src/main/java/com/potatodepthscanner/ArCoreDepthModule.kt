@@ -18,13 +18,14 @@ import kotlin.math.max
 import kotlin.math.min
 
 /**
- * Single-shot depth measurement module.
- * When measureDepth() is called:
- *   1. Creates EGL context + ARCore session
- *   2. Waits for tracking + depth data
- *   3. Reads ALL pixels from depth image, averages them
- *   4. Returns the average distance in meters
- *   5. Cleans up everything
+ * Single-shot depth measurement using ARCore raw depth (ToF sensor).
+ *
+ * Key accuracy improvements:
+ * 1. Uses acquireRawDepthImage() — direct ToF sensor data, not computed stereo depth
+ * 2. Uses the raw depth confidence image to filter unreliable pixels
+ * 3. Only samples the CENTER 30% of the depth image (where you're pointing)
+ * 4. Uses MEDIAN instead of mean (robust to outliers)
+ * 5. Averages median across multiple frames for stability
  */
 class ArCoreDepthModule(reactContext: ReactApplicationContext) :
     ReactContextBaseJavaModule(reactContext) {
@@ -32,8 +33,10 @@ class ArCoreDepthModule(reactContext: ReactApplicationContext) :
     companion object {
         const val NAME = "ArCoreDepthModule"
         const val TAG = "ArCoreDepth"
-        const val MAX_ATTEMPTS = 60     // Max frames to try (about 6 seconds at ~10fps)
-        const val DEPTH_ATTEMPTS = 10   // Number of successful depth frames to average
+        const val MAX_ATTEMPTS = 80        // Max frames to try (~8 seconds)
+        const val DEPTH_FRAMES = 5         // Number of good frames to average
+        const val CENTER_RATIO = 0.3f      // Use center 30% of image
+        const val MIN_CONFIDENCE = 128     // Confidence threshold (0-255)
     }
 
     override fun getName(): String = NAME
@@ -63,14 +66,6 @@ class ArCoreDepthModule(reactContext: ReactApplicationContext) :
         }
     }
 
-    /**
-     * Perform a single-shot depth measurement.
-     * Pauses camera externally first, then:
-     *   1. Opens ARCore session
-     *   2. Waits for tracking
-     *   3. Collects multiple depth frames and averages ALL pixels
-     *   4. Returns result as a map: { averageDistance, minDistance, maxDistance, pixelCount }
-     */
     @ReactMethod
     fun measureDepth(promise: Promise) {
         Thread {
@@ -87,9 +82,7 @@ class ArCoreDepthModule(reactContext: ReactApplicationContext) :
                     return@Thread
                 }
 
-                Log.d(TAG, "measureDepth: Setting up EGL context...")
-
-                // 1. Create EGL context
+                // 1. Create EGL context (required by ARCore)
                 eglDisplay = EGL14.eglGetDisplay(EGL14.EGL_DEFAULT_DISPLAY)
                 val version = IntArray(2)
                 EGL14.eglInitialize(eglDisplay, version, 0, version, 1)
@@ -116,8 +109,8 @@ class ArCoreDepthModule(reactContext: ReactApplicationContext) :
                 GLES20.glGenTextures(1, textures, 0)
                 textureId = textures[0]
 
-                // 2. Create ARCore session
-                Log.d(TAG, "measureDepth: Creating ARCore session...")
+                // 2. Create ARCore session with raw depth enabled
+                Log.d(TAG, "measureDepth: Creating ARCore session with raw depth...")
                 session = Session(activity as Context)
                 val config = Config(session)
                 config.depthMode = Config.DepthMode.AUTOMATIC
@@ -126,18 +119,17 @@ class ArCoreDepthModule(reactContext: ReactApplicationContext) :
                 session.setCameraTextureName(textureId)
                 session.resume()
 
-                Log.d(TAG, "measureDepth: Waiting for tracking...")
-                Thread.sleep(1500) // Let ARCore initialize
+                Log.d(TAG, "measureDepth: Waiting for ARCore to initialize...")
+                Thread.sleep(2000)
 
-                // 3. Collect depth data from multiple frames
-                var totalDistance = 0.0
-                var totalPixels: Long = 0
-                var minDist = Double.MAX_VALUE
-                var maxDist = 0.0
-                var successfulFrames = 0
+                // 3. Collect depth frames
+                val frameMedians = mutableListOf<Double>()
+                var allMins = Double.MAX_VALUE
+                var allMaxs = 0.0
                 var attempts = 0
+                var totalPixelsUsed: Long = 0
 
-                while (successfulFrames < DEPTH_ATTEMPTS && attempts < MAX_ATTEMPTS) {
+                while (frameMedians.size < DEPTH_FRAMES && attempts < MAX_ATTEMPTS) {
                     attempts++
                     try {
                         val frame = session.update()
@@ -148,49 +140,19 @@ class ArCoreDepthModule(reactContext: ReactApplicationContext) :
                             continue
                         }
 
-                        var depthImage: Image? = null
-                        try {
-                            depthImage = frame.acquireDepthImage()
-                            val width = depthImage.width
-                            val height = depthImage.height
-                            val plane = depthImage.planes[0]
-                            val buffer: ShortBuffer = plane.buffer.asShortBuffer()
-                            val shortsPerRow = plane.rowStride / 2
+                        // Try raw depth first (ToF sensor), fall back to processed depth
+                        val result = tryReadRawDepth(frame) ?: tryReadProcessedDepth(frame)
 
-                            // Read ALL pixels
-                            var frameTotal = 0.0
-                            var frameCount = 0
-                            var frameMin = Double.MAX_VALUE
-                            var frameMax = 0.0
-
-                            for (y in 0 until height) {
-                                for (x in 0 until width) {
-                                    val index = y * shortsPerRow + x
-                                    if (index < buffer.limit()) {
-                                        val depthMm = buffer.get(index).toInt() and 0xFFFF
-                                        if (depthMm in 100..8000) { // 10cm to 8m valid range
-                                            val depthM = depthMm / 1000.0
-                                            frameTotal += depthM
-                                            frameCount++
-                                            if (depthM < frameMin) frameMin = depthM
-                                            if (depthM > frameMax) frameMax = depthM
-                                        }
-                                    }
-                                }
-                            }
-
-                            if (frameCount > 0) {
-                                totalDistance += frameTotal / frameCount
-                                totalPixels += frameCount
-                                if (frameMin < minDist) minDist = frameMin
-                                if (frameMax > maxDist) maxDist = frameMax
-                                successfulFrames++
-                                Log.d(TAG, "measureDepth: Frame $successfulFrames avg=${String.format("%.3f", frameTotal/frameCount)}m ($frameCount pixels)")
-                            }
-                        } catch (_: NotYetAvailableException) {
-                            // Normal
-                        } finally {
-                            depthImage?.close()
+                        if (result != null) {
+                            frameMedians.add(result.median)
+                            if (result.min < allMins) allMins = result.min
+                            if (result.max > allMaxs) allMaxs = result.max
+                            totalPixelsUsed += result.pixelCount
+                            Log.d(TAG, "measureDepth: Frame ${frameMedians.size} " +
+                                "median=${String.format("%.3f", result.median)}m " +
+                                "min=${String.format("%.3f", result.min)}m " +
+                                "max=${String.format("%.3f", result.max)}m " +
+                                "(${result.pixelCount} pixels, ${result.source})")
                         }
 
                         Thread.sleep(100)
@@ -200,17 +162,27 @@ class ArCoreDepthModule(reactContext: ReactApplicationContext) :
                     }
                 }
 
-                // 4. Return results
-                if (successfulFrames > 0) {
-                    val avgDistance = totalDistance / successfulFrames
-                    Log.d(TAG, "measureDepth: RESULT avg=${String.format("%.3f", avgDistance)}m from $successfulFrames frames")
+                // 4. Return averaged median across frames
+                if (frameMedians.isNotEmpty()) {
+                    val avgMedian = frameMedians.sorted()
+                        .let { sorted ->
+                            // Median of medians for robustness
+                            if (sorted.size % 2 == 0) {
+                                (sorted[sorted.size / 2 - 1] + sorted[sorted.size / 2]) / 2.0
+                            } else {
+                                sorted[sorted.size / 2]
+                            }
+                        }
+
+                    Log.d(TAG, "measureDepth: FINAL distance=${String.format("%.3f", avgMedian)}m " +
+                        "from ${frameMedians.size} frames")
 
                     val result = Arguments.createMap().apply {
-                        putDouble("averageDistance", avgDistance)
-                        putDouble("minDistance", if (minDist == Double.MAX_VALUE) 0.0 else minDist)
-                        putDouble("maxDistance", maxDist)
-                        putInt("framesUsed", successfulFrames)
-                        putDouble("totalPixels", totalPixels.toDouble())
+                        putDouble("averageDistance", avgMedian)
+                        putDouble("minDistance", if (allMins == Double.MAX_VALUE) 0.0 else allMins)
+                        putDouble("maxDistance", allMaxs)
+                        putInt("framesUsed", frameMedians.size)
+                        putDouble("totalPixels", totalPixelsUsed.toDouble())
                     }
                     promise.resolve(result)
                 } else {
@@ -222,7 +194,6 @@ class ArCoreDepthModule(reactContext: ReactApplicationContext) :
             } catch (e: Exception) {
                 promise.reject("ERROR", "${e.javaClass.simpleName}: ${e.message}")
             } finally {
-                // 5. Clean up
                 try { session?.pause() } catch (_: Exception) {}
                 try { session?.close() } catch (_: Exception) {}
                 if (textureId != -1) {
@@ -234,9 +205,132 @@ class ArCoreDepthModule(reactContext: ReactApplicationContext) :
                     eglContext?.let { EGL14.eglDestroyContext(eglDisplay, it) }
                     EGL14.eglTerminate(eglDisplay)
                 }
-                Log.d(TAG, "measureDepth: Cleaned up")
             }
         }.start()
+    }
+
+    data class DepthFrameResult(
+        val median: Double,
+        val min: Double,
+        val max: Double,
+        val pixelCount: Int,
+        val source: String
+    )
+
+    /**
+     * Try reading raw depth image (direct from ToF sensor).
+     * Returns null if not available.
+     */
+    private fun tryReadRawDepth(frame: Frame): DepthFrameResult? {
+        var depthImage: Image? = null
+        var confidenceImage: Image? = null
+        try {
+            depthImage = frame.acquireRawDepthImage()
+            confidenceImage = frame.acquireRawDepthConfidenceImage()
+            return processDepthImage(depthImage, confidenceImage, "ToF")
+        } catch (_: NotYetAvailableException) {
+            return null
+        } catch (e: Exception) {
+            Log.d(TAG, "Raw depth not available: ${e.message}")
+            return null
+        } finally {
+            depthImage?.close()
+            confidenceImage?.close()
+        }
+    }
+
+    /**
+     * Fall back to processed depth image (stereo-based).
+     */
+    private fun tryReadProcessedDepth(frame: Frame): DepthFrameResult? {
+        var depthImage: Image? = null
+        try {
+            depthImage = frame.acquireDepthImage()
+            return processDepthImage(depthImage, null, "stereo")
+        } catch (_: NotYetAvailableException) {
+            return null
+        } catch (e: Exception) {
+            Log.d(TAG, "Processed depth not available: ${e.message}")
+            return null
+        } finally {
+            depthImage?.close()
+        }
+    }
+
+    /**
+     * Process a depth image: sample CENTER region only, use confidence filter,
+     * return MEDIAN (not mean) of valid pixels.
+     */
+    private fun processDepthImage(
+        depthImage: Image,
+        confidenceImage: Image?,
+        source: String
+    ): DepthFrameResult? {
+        val width = depthImage.width
+        val height = depthImage.height
+
+        val depthPlane = depthImage.planes[0]
+        val depthBuffer: ShortBuffer = depthPlane.buffer.asShortBuffer()
+        val depthRowStride = depthPlane.rowStride / 2 // Convert bytes to shorts
+
+        // Confidence buffer (if available)
+        val confBuffer = confidenceImage?.planes?.get(0)?.buffer
+        val confRowStride = confidenceImage?.planes?.get(0)?.rowStride ?: 0
+
+        // Calculate center region bounds (center 30%)
+        val marginX = ((1.0f - CENTER_RATIO) / 2 * width).toInt()
+        val marginY = ((1.0f - CENTER_RATIO) / 2 * height).toInt()
+        val startX = marginX
+        val endX = width - marginX
+        val startY = marginY
+        val endY = height - marginY
+
+        // Collect all valid center-region depth values
+        val depthValues = mutableListOf<Double>()
+
+        for (y in startY until endY) {
+            for (x in startX until endX) {
+                // Check confidence if available
+                if (confBuffer != null) {
+                    val confIndex = y * confRowStride + x
+                    if (confIndex < confBuffer.limit()) {
+                        val confidence = confBuffer.get(confIndex).toInt() and 0xFF
+                        if (confidence < MIN_CONFIDENCE) continue // Skip low-confidence pixels
+                    }
+                }
+
+                val depthIndex = y * depthRowStride + x
+                if (depthIndex < depthBuffer.limit()) {
+                    val depthMm = depthBuffer.get(depthIndex).toInt() and 0xFFFF
+                    // Valid range: 5cm to 5m (focused on close-range accuracy)
+                    if (depthMm in 50..5000) {
+                        depthValues.add(depthMm / 1000.0)
+                    }
+                }
+            }
+        }
+
+        if (depthValues.isEmpty()) return null
+
+        // Sort for median calculation
+        depthValues.sort()
+
+        val median = if (depthValues.size % 2 == 0) {
+            (depthValues[depthValues.size / 2 - 1] + depthValues[depthValues.size / 2]) / 2.0
+        } else {
+            depthValues[depthValues.size / 2]
+        }
+
+        val minVal = depthValues.first()
+        val maxVal = depthValues.last()
+
+        return DepthFrameResult(
+            median = median,
+            min = minVal,
+            max = maxVal,
+            pixelCount = depthValues.size,
+            source = source
+        )
     }
 
     @ReactMethod fun addListener(eventName: String) {}
