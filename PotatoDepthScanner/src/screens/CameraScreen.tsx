@@ -51,22 +51,25 @@ export const CameraScreen: React.FC = () => {
         if (!cameraRef.current || isCapturing || isMeasuring) return;
 
         try {
-            // Step 1: Take photo
+            // Step 1: Take photo while camera is active
             setIsCapturing(true);
             const photo = await cameraRef.current.takePhoto({
                 flash: 'off',
                 enableShutterSound: true,
             });
-            setCapturedPhoto(photo);
             setIsCapturing(false);
 
-            // Step 2: Measure depth
-            setIsMeasuring(true);
-
-            // Pause Vision Camera in case ARCore fallback needs it
+            // Step 2: FIRST deactivate camera to release hardware
             setIsCameraActive(false);
-            await new Promise<void>(resolve => setTimeout(() => resolve(), 1500));
 
+            // Step 3: THEN show the photo preview
+            setCapturedPhoto(photo);
+
+            // Step 4: Wait for camera hardware to fully release (3 seconds)
+            setIsMeasuring(true);
+            await new Promise<void>(resolve => setTimeout(() => resolve(), 3000));
+
+            // Step 5: Measure depth with ARCore
             try {
                 const result = await measureDepth();
                 setDepthResult(result);
