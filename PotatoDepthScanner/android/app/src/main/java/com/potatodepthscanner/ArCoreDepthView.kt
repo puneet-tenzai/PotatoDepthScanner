@@ -196,16 +196,19 @@ class ArCoreDepthView(context: Context) : GLSurfaceView(context), GLSurfaceView.
             // Get transformed texture coordinates for proper camera orientation
             frame.transformCoordinates2d(
                 Coordinates2d.OPENGL_NORMALIZED_DEVICE_COORDINATES,
-                vertexBuffer!!,
+                QUAD_VERTICES,
                 Coordinates2d.TEXTURE_NORMALIZED,
                 transformedTexCoords
             )
 
             // Update tex coord buffer
-            texCoordBuffer = ByteBuffer.allocateDirect(transformedTexCoords.size * 4)
-                .order(ByteOrder.nativeOrder())
-                .asFloatBuffer()
-                .put(transformedTexCoords)
+            if (texCoordBuffer == null) {
+                texCoordBuffer = ByteBuffer.allocateDirect(transformedTexCoords.size * 4)
+                    .order(ByteOrder.nativeOrder())
+                    .asFloatBuffer()
+            }
+            texCoordBuffer?.clear()
+            texCoordBuffer?.put(transformedTexCoords)
             texCoordBuffer?.position(0)
 
             // Draw camera background
