@@ -11,6 +11,6 @@ class ArCoreDepthPackage : ReactPackage {
     }
 
     override fun createViewManagers(reactContext: ReactApplicationContext): List<ViewManager<*, *>> {
-        return listOf(ArCoreDepthViewManager())
+        return emptyList()
     }
 }

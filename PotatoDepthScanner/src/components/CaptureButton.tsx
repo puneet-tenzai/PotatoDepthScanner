@@ -1,60 +1,52 @@
 import React from 'react';
-import { TouchableOpacity, View, StyleSheet, Text } from 'react-native';
+import { TouchableOpacity, View, StyleSheet, Text, ActivityIndicator } from 'react-native';
 
 interface CaptureButtonProps {
     onCapture: () => void;
-    onToggleDepth: () => void;
-    isDepthActive: boolean;
-    isDepthSupported: boolean | null;
     isCapturing: boolean;
+    isMeasuring: boolean;
 }
 
 export const CaptureButton: React.FC<CaptureButtonProps> = ({
     onCapture,
-    onToggleDepth,
-    isDepthActive,
-    isDepthSupported,
     isCapturing,
+    isMeasuring,
 }) => {
+    const isDisabled = isCapturing || isMeasuring;
+
     return (
         <View style={styles.container}>
-            {/* Depth toggle button */}
-            {isDepthSupported !== false && (
-                <TouchableOpacity
-                    style={[
-                        styles.depthButton,
-                        isDepthActive && styles.depthButtonActive,
-                    ]}
-                    onPress={onToggleDepth}
-                    activeOpacity={0.7}>
-                    <Text style={styles.depthIcon}>📏</Text>
-                    <Text
-                        style={[
-                            styles.depthText,
-                            isDepthActive && styles.depthTextActive,
-                        ]}>
-                        {isDepthActive ? 'DEPTH ON' : 'DEPTH'}
-                    </Text>
-                </TouchableOpacity>
+            {/* Status indicator */}
+            {isMeasuring && (
+                <View style={styles.statusContainer}>
+                    <ActivityIndicator size="small" color="#00E676" />
+                    <Text style={styles.statusText}>Measuring depth...</Text>
+                </View>
             )}
 
             {/* Main capture button */}
             <TouchableOpacity
-                style={styles.captureOuter}
+                style={[styles.captureOuter, isDisabled && styles.captureDisabled]}
                 onPress={onCapture}
-                disabled={isCapturing}
+                disabled={isDisabled}
                 activeOpacity={0.6}>
                 <View
                     style={[
                         styles.captureInner,
                         isCapturing && styles.captureInnerActive,
                     ]}>
-                    {isCapturing && <Text style={styles.captureText}>📸</Text>}
+                    {isCapturing ? (
+                        <Text style={styles.captureText}>📸</Text>
+                    ) : (
+                        <Text style={styles.captureHint}>TAP</Text>
+                    )}
                 </View>
             </TouchableOpacity>
 
-            {/* Spacer for symmetry */}
-            <View style={styles.spacer} />
+            {/* Info text */}
+            <Text style={styles.infoText}>
+                Capture + Measure Depth
+            </Text>
         </View>
     );
 };
@@ -65,10 +57,22 @@ const styles = StyleSheet.create({
         bottom: 30,
         left: 0,
         right: 0,
-        flexDirection: 'row',
-        justifyContent: 'space-around',
         alignItems: 'center',
-        paddingHorizontal: 30,
+    },
+    statusContainer: {
+        flexDirection: 'row',
+        alignItems: 'center',
+        backgroundColor: 'rgba(0, 0, 0, 0.7)',
+        paddingVertical: 8,
+        paddingHorizontal: 16,
+        borderRadius: 20,
+        marginBottom: 16,
+    },
+    statusText: {
+        color: '#00E676',
+        fontSize: 13,
+        fontWeight: '600',
+        marginLeft: 8,
     },
     captureOuter: {
         width: 80,
@@ -79,6 +83,9 @@ const styles = StyleSheet.create({
         justifyContent: 'center',
         alignItems: 'center',
         backgroundColor: 'rgba(255, 255, 255, 0.15)',
+    },
+    captureDisabled: {
+        opacity: 0.5,
     },
     captureInner: {
         width: 64,
@@ -94,35 +101,16 @@ const styles = StyleSheet.create({
     captureText: {
         fontSize: 24,
     },
-    depthButton: {
-        width: 60,
-        height: 60,
-        borderRadius: 30,
-        backgroundColor: 'rgba(255, 255, 255, 0.15)',
-        borderWidth: 2,
-        borderColor: 'rgba(255, 255, 255, 0.4)',
-        justifyContent: 'center',
-        alignItems: 'center',
-    },
-    depthButtonActive: {
-        backgroundColor: 'rgba(0, 230, 118, 0.3)',
-        borderColor: '#00E676',
-    },
-    depthIcon: {
-        fontSize: 20,
-    },
-    depthText: {
-        color: '#FFFFFF',
-        fontSize: 8,
+    captureHint: {
+        fontSize: 12,
         fontWeight: '800',
-        letterSpacing: 0.5,
-        marginTop: 2,
+        color: '#333',
+        letterSpacing: 1,
     },
-    depthTextActive: {
-        color: '#00E676',
-    },
-    spacer: {
-        width: 60,
-        height: 60,
+    infoText: {
+        color: 'rgba(255, 255, 255, 0.6)',
+        fontSize: 11,
+        fontWeight: '500',
+        marginTop: 8,
     },
 });

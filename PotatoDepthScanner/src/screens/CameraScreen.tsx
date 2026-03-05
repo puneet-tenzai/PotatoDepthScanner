@@ -17,10 +17,8 @@ import {
     PhotoFile,
 } from 'react-native-vision-camera';
 import { CameraRoll } from '@react-native-camera-roll/camera-roll';
-import { DepthOverlay } from '../components/DepthOverlay';
 import { CaptureButton } from '../components/CaptureButton';
-import { ArCoreDepthViewComponent } from '../components/ArCoreDepthViewComponent';
-import { useDepthData } from '../modules/DepthModule';
+import { isDepthSupported, measureDepth, DepthResult } from '../modules/DepthModule';
 
 export const CameraScreen: React.FC = () => {
     const cameraRef = useRef<Camera>(null);
@@ -28,10 +26,17 @@ export const CameraScreen: React.FC = () => {
     const { hasPermission, requestPermission } = useCameraPermission();
 
     const [isCapturing, setIsCapturing] = useState(false);
+    const [isMeasuring, setIsMeasuring] = useState(false);
     const [capturedPhoto, setCapturedPhoto] = useState<PhotoFile | null>(null);
+    const [depthResult, setDepthResult] = useState<DepthResult | null>(null);
     const [isSaving, setIsSaving] = useState(false);
+    const [isCameraActive, setIsCameraActive] = useState(true);
+    const [depthSupported, setDepthSupported] = useState<boolean | null>(null);
 
-    const { depthData, isActive: isDepthActive, isSupported, error, toggleDepth } = useDepthData();
+    // Check depth support on mount
+    useEffect(() => {
+        isDepthSupported().then(setDepthSupported);
+    }, []);
 
     // Request camera permission on mount
     useEffect(() => {
@@ -40,32 +45,48 @@ export const CameraScreen: React.FC = () => {
         }
     }, [hasPermission, requestPermission]);
 
-    // Capture photo
+    // Capture photo then measure depth
     const handleCapture = useCallback(async () => {
-        if (!cameraRef.current || isCapturing) return;
-
-        if (isDepthActive) {
-            Alert.alert(
-                'Depth Active',
-                'Please turn off depth sensing before taking a photo.',
-                [{ text: 'OK' }],
-            );
-            return;
-        }
+        if (!cameraRef.current || isCapturing || isMeasuring) return;
 
         try {
+            // Step 1: Take photo
             setIsCapturing(true);
             const photo = await cameraRef.current.takePhoto({
                 flash: 'off',
                 enableShutterSound: true,
             });
             setCapturedPhoto(photo);
+            setIsCapturing(false);
+
+            // Step 2: Measure depth with ARCore
+            setIsMeasuring(true);
+
+            // Pause Vision Camera so ARCore can use it
+            setIsCameraActive(false);
+
+            // Give camera time to release
+            await new Promise(resolve => setTimeout(resolve, 1500));
+
+            try {
+                const result = await measureDepth();
+                setDepthResult(result);
+            } catch (e: any) {
+                console.warn('Depth measurement failed:', e.message);
+                setDepthResult(null);
+                // Don't show alert — silently fail, photo is still captured
+            }
+
+            // Resume camera
+            setIsCameraActive(true);
+            setIsMeasuring(false);
         } catch (e: any) {
             Alert.alert('Capture Error', e.message || 'Failed to take photo');
-        } finally {
             setIsCapturing(false);
+            setIsMeasuring(false);
+            setIsCameraActive(true);
         }
-    }, [isCapturing, isDepthActive]);
+    }, [isCapturing, isMeasuring]);
 
     // Save photo to gallery
     const handleSavePhoto = useCallback(async () => {
@@ -77,6 +98,7 @@ export const CameraScreen: React.FC = () => {
             await CameraRoll.saveAsset(uri, { type: 'photo' });
             Alert.alert('✅ Saved!', 'Photo saved to your gallery');
             setCapturedPhoto(null);
+            setDepthResult(null);
         } catch (e: any) {
             Alert.alert('Save Error', e.message || 'Failed to save photo');
         } finally {
@@ -87,6 +109,7 @@ export const CameraScreen: React.FC = () => {
     // Discard captured photo
     const handleDiscard = useCallback(() => {
         setCapturedPhoto(null);
+        setDepthResult(null);
     }, []);
 
     // --- Permission not granted ---
@@ -127,22 +150,65 @@ export const CameraScreen: React.FC = () => {
         );
     }
 
-    // --- Photo preview ---
+    // --- Photo preview with depth result ---
     if (capturedPhoto) {
         return (
             <View style={styles.previewContainer}>
                 <StatusBar barStyle="light-content" backgroundColor="#0D0D0D" />
+
                 <Image
                     source={{ uri: `file://${capturedPhoto.path}` }}
                     style={styles.previewImage}
                     resizeMode="contain"
                 />
 
-                {depthData && depthData.distance > 0 && (
-                    <View style={styles.previewDepthBadge}>
-                        <Text style={styles.previewDepthText}>
-                            📏 {depthData.distance.toFixed(2)} m
-                        </Text>
+                {/* Depth measurement result */}
+                {depthResult && (
+                    <View style={styles.depthResultContainer}>
+                        <View style={styles.depthResultCard}>
+                            <Text style={styles.depthResultLabel}>DISTANCE TO GROUND</Text>
+                            <Text style={styles.depthResultValue}>
+                                {depthResult.averageDistance.toFixed(2)} m
+                            </Text>
+                            <Text style={styles.depthResultFeet}>
+                                ≈ {(depthResult.averageDistance * 3.281).toFixed(1)} ft
+                            </Text>
+                            <View style={styles.depthDetails}>
+                                <Text style={styles.depthDetailText}>
+                                    Min: {depthResult.minDistance.toFixed(2)}m
+                                </Text>
+                                <Text style={styles.depthDetailText}>
+                                    Max: {depthResult.maxDistance.toFixed(2)}m
+                                </Text>
+                            </View>
+                            <Text style={styles.depthFrameInfo}>
+                                {depthResult.framesUsed} frames averaged
+                            </Text>
+                        </View>
+                    </View>
+                )}
+
+                {!depthResult && !isMeasuring && (
+                    <View style={styles.depthResultContainer}>
+                        <View style={[styles.depthResultCard, styles.depthResultCardError]}>
+                            <Text style={styles.depthResultLabel}>DEPTH MEASUREMENT</Text>
+                            <Text style={styles.depthUnavailable}>Not available</Text>
+                            <Text style={styles.depthDetailText}>
+                                Could not measure depth for this photo
+                            </Text>
+                        </View>
+                    </View>
+                )}
+
+                {isMeasuring && (
+                    <View style={styles.depthResultContainer}>
+                        <View style={styles.depthResultCard}>
+                            <Text style={styles.depthResultLabel}>MEASURING DEPTH...</Text>
+                            <Text style={styles.depthMeasuring}>⏳</Text>
+                            <Text style={styles.depthDetailText}>
+                                Processing with ARCore
+                            </Text>
+                        </View>
                     </View>
                 )}
 
@@ -154,11 +220,11 @@ export const CameraScreen: React.FC = () => {
                     </TouchableOpacity>
 
                     <TouchableOpacity
-                        style={styles.saveButton}
+                        style={[styles.saveButton, isMeasuring && styles.saveButtonDisabled]}
                         onPress={handleSavePhoto}
-                        disabled={isSaving}>
+                        disabled={isSaving || isMeasuring}>
                         <Text style={styles.saveText}>
-                            {isSaving ? 'Saving...' : '💾 Save to Gallery'}
+                            {isSaving ? 'Saving...' : '💾 Save'}
                         </Text>
                     </TouchableOpacity>
                 </View>
@@ -171,45 +237,27 @@ export const CameraScreen: React.FC = () => {
         <View style={styles.container}>
             <StatusBar barStyle="light-content" backgroundColor="transparent" translucent />
 
-            {/* Vision Camera — visible when depth is OFF */}
-            {!isDepthActive && (
-                <Camera
-                    ref={cameraRef}
-                    style={StyleSheet.absoluteFill}
-                    device={device}
-                    isActive={true}
-                    photo={true}
-                />
-            )}
-
-            {/* ARCore Depth View — visible when depth is ON */}
-            {isDepthActive && (
-                <ArCoreDepthViewComponent
-                    style={StyleSheet.absoluteFill}
-                    isActive={true}
-                />
-            )}
-
-            {/* Depth overlay */}
-            <DepthOverlay
-                depthData={depthData}
-                isActive={isDepthActive}
-                isSupported={isSupported}
-                error={error}
+            <Camera
+                ref={cameraRef}
+                style={StyleSheet.absoluteFill}
+                device={device}
+                isActive={isCameraActive}
+                photo={true}
             />
 
-            {/* Top bar with app name */}
+            {/* Top bar */}
             <View style={styles.topBar}>
                 <Text style={styles.appTitle}>🥔 Potato Depth Scanner</Text>
+                {depthSupported === true && (
+                    <Text style={styles.depthBadge}>ARCore ✓</Text>
+                )}
             </View>
 
-            {/* Capture and depth controls */}
+            {/* Capture button */}
             <CaptureButton
                 onCapture={handleCapture}
-                onToggleDepth={toggleDepth}
-                isDepthActive={isDepthActive}
-                isDepthSupported={isSupported}
                 isCapturing={isCapturing}
+                isMeasuring={isMeasuring}
             />
         </View>
     );
@@ -275,12 +323,24 @@ const styles = StyleSheet.create({
         paddingBottom: 12,
         paddingHorizontal: 20,
         backgroundColor: 'rgba(0, 0, 0, 0.4)',
+        flexDirection: 'row',
+        justifyContent: 'space-between',
+        alignItems: 'center',
     },
     appTitle: {
         color: '#FFFFFF',
         fontSize: 18,
         fontWeight: '800',
         letterSpacing: 0.5,
+    },
+    depthBadge: {
+        color: '#00E676',
+        fontSize: 12,
+        fontWeight: '700',
+        backgroundColor: 'rgba(0, 230, 118, 0.15)',
+        paddingVertical: 4,
+        paddingHorizontal: 10,
+        borderRadius: 10,
     },
     previewContainer: {
         flex: 1,
@@ -289,21 +349,68 @@ const styles = StyleSheet.create({
     previewImage: {
         flex: 1,
     },
-    previewDepthBadge: {
+    depthResultContainer: {
         position: 'absolute',
         top: 60,
-        alignSelf: 'center',
-        backgroundColor: 'rgba(0, 0, 0, 0.75)',
-        paddingVertical: 8,
-        paddingHorizontal: 20,
-        borderRadius: 20,
+        left: 20,
+        right: 20,
+        alignItems: 'center',
+    },
+    depthResultCard: {
+        backgroundColor: 'rgba(0, 0, 0, 0.85)',
+        borderRadius: 16,
+        paddingVertical: 16,
+        paddingHorizontal: 24,
+        alignItems: 'center',
         borderWidth: 1,
         borderColor: '#00E676',
+        minWidth: 200,
     },
-    previewDepthText: {
-        color: '#00E676',
-        fontSize: 16,
+    depthResultCardError: {
+        borderColor: '#FF9100',
+    },
+    depthResultLabel: {
+        color: '#AAAAAA',
+        fontSize: 11,
         fontWeight: '700',
+        letterSpacing: 2,
+        marginBottom: 8,
+    },
+    depthResultValue: {
+        color: '#00E676',
+        fontSize: 36,
+        fontWeight: '800',
+    },
+    depthResultFeet: {
+        color: '#888888',
+        fontSize: 14,
+        fontWeight: '500',
+        marginTop: 4,
+    },
+    depthDetails: {
+        flexDirection: 'row',
+        gap: 16,
+        marginTop: 12,
+    },
+    depthDetailText: {
+        color: '#888888',
+        fontSize: 12,
+        fontWeight: '500',
+    },
+    depthFrameInfo: {
+        color: '#666666',
+        fontSize: 10,
+        fontWeight: '500',
+        marginTop: 8,
+    },
+    depthUnavailable: {
+        color: '#FF9100',
+        fontSize: 20,
+        fontWeight: '700',
+    },
+    depthMeasuring: {
+        fontSize: 32,
+        marginVertical: 8,
     },
     previewActions: {
         flexDirection: 'row',
@@ -330,6 +437,9 @@ const styles = StyleSheet.create({
         paddingVertical: 14,
         paddingHorizontal: 30,
         borderRadius: 30,
+    },
+    saveButtonDisabled: {
+        opacity: 0.5,
     },
     saveText: {
         color: '#FFFFFF',
