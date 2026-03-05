@@ -30,7 +30,6 @@ export const CameraScreen: React.FC = () => {
     const [capturedPhoto, setCapturedPhoto] = useState<PhotoFile | null>(null);
     const [depthResult, setDepthResult] = useState<DepthResult | null>(null);
     const [isSaving, setIsSaving] = useState(false);
-    const [isCameraActive, setIsCameraActive] = useState(true);
     const [depthSupported, setDepthSupported] = useState<boolean | null>(null);
 
     // Check depth support on mount
@@ -59,14 +58,9 @@ export const CameraScreen: React.FC = () => {
             setCapturedPhoto(photo);
             setIsCapturing(false);
 
-            // Step 2: Measure depth with ARCore
+            // Step 2: Measure depth with ToF sensor
+            // (ToF is a separate camera device — no need to pause Vision Camera)
             setIsMeasuring(true);
-
-            // Pause Vision Camera so ARCore can use it
-            setIsCameraActive(false);
-
-            // Give camera time to release
-            await new Promise(resolve => setTimeout(resolve, 1500));
 
             try {
                 const result = await measureDepth();
@@ -74,17 +68,13 @@ export const CameraScreen: React.FC = () => {
             } catch (e: any) {
                 console.warn('Depth measurement failed:', e.message);
                 setDepthResult(null);
-                // Don't show alert — silently fail, photo is still captured
             }
 
-            // Resume camera
-            setIsCameraActive(true);
             setIsMeasuring(false);
         } catch (e: any) {
             Alert.alert('Capture Error', e.message || 'Failed to take photo');
             setIsCapturing(false);
             setIsMeasuring(false);
-            setIsCameraActive(true);
         }
     }, [isCapturing, isMeasuring]);
 
@@ -241,7 +231,7 @@ export const CameraScreen: React.FC = () => {
                 ref={cameraRef}
                 style={StyleSheet.absoluteFill}
                 device={device}
-                isActive={isCameraActive}
+                isActive={true}
                 photo={true}
             />
 
