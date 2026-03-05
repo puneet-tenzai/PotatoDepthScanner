@@ -18,7 +18,7 @@ import {
 } from 'react-native-vision-camera';
 import { CameraRoll } from '@react-native-camera-roll/camera-roll';
 import { CaptureButton } from '../components/CaptureButton';
-import { isDepthSupported, measureDepth, DepthResult } from '../modules/DepthModule';
+import { isDepthSupported, measureDepth, diagnoseDepthSensors, DepthResult } from '../modules/DepthModule';
 
 export const CameraScreen: React.FC = () => {
     const cameraRef = useRef<Camera>(null);
@@ -30,11 +30,13 @@ export const CameraScreen: React.FC = () => {
     const [capturedPhoto, setCapturedPhoto] = useState<PhotoFile | null>(null);
     const [depthResult, setDepthResult] = useState<DepthResult | null>(null);
     const [isSaving, setIsSaving] = useState(false);
+    const [isCameraActive, setIsCameraActive] = useState(true);
     const [depthSupported, setDepthSupported] = useState<boolean | null>(null);
 
-    // Check depth support on mount
+    // Check depth support and log sensor diagnostics on mount
     useEffect(() => {
         isDepthSupported().then(setDepthSupported);
+        diagnoseDepthSensors().then(info => console.log('Depth sensors:', info));
     }, []);
 
     // Request camera permission on mount
@@ -58,9 +60,12 @@ export const CameraScreen: React.FC = () => {
             setCapturedPhoto(photo);
             setIsCapturing(false);
 
-            // Step 2: Measure depth with ToF sensor
-            // (ToF is a separate camera device — no need to pause Vision Camera)
+            // Step 2: Measure depth
             setIsMeasuring(true);
+
+            // Pause Vision Camera in case ARCore fallback needs it
+            setIsCameraActive(false);
+            await new Promise<void>(resolve => setTimeout(() => resolve(), 1500));
 
             try {
                 const result = await measureDepth();
@@ -70,11 +75,13 @@ export const CameraScreen: React.FC = () => {
                 setDepthResult(null);
             }
 
+            setIsCameraActive(true);
             setIsMeasuring(false);
         } catch (e: any) {
             Alert.alert('Capture Error', e.message || 'Failed to take photo');
             setIsCapturing(false);
             setIsMeasuring(false);
+            setIsCameraActive(true);
         }
     }, [isCapturing, isMeasuring]);
 
@@ -172,7 +179,7 @@ export const CameraScreen: React.FC = () => {
                                 </Text>
                             </View>
                             <Text style={styles.depthFrameInfo}>
-                                {depthResult.framesUsed} frames averaged
+                                {depthResult.framesUsed} frames • {depthResult.method || 'unknown'}
                             </Text>
                         </View>
                     </View>
@@ -231,7 +238,7 @@ export const CameraScreen: React.FC = () => {
                 ref={cameraRef}
                 style={StyleSheet.absoluteFill}
                 device={device}
-                isActive={true}
+                isActive={isCameraActive}
                 photo={true}
             />
 

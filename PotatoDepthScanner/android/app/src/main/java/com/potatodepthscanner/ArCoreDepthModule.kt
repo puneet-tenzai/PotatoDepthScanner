@@ -8,26 +8,30 @@ import android.graphics.ImageFormat
 import android.hardware.camera2.*
 import android.media.Image
 import android.media.ImageReader
+import android.opengl.EGL14
+import android.opengl.EGLConfig
+import android.opengl.EGLContext
+import android.opengl.EGLDisplay
+import android.opengl.EGLSurface
+import android.opengl.GLES20
 import android.os.Handler
 import android.os.HandlerThread
 import android.util.Log
 import android.util.Size
 import androidx.core.app.ActivityCompat
 import com.facebook.react.bridge.*
+import com.google.ar.core.*
+import com.google.ar.core.exceptions.*
 import java.nio.ShortBuffer
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
 
 /**
- * Direct ToF sensor access via Camera2 API.
- * Bypasses ARCore entirely for accurate hardware depth measurements.
- *
- * Flow:
- * 1. Find the depth camera (ToF sensor) via CameraManager
- * 2. Open it and capture depth frames in DEPTH16 format
- * 3. Read center region, use median for robust result
- * 4. Clean up and return
+ * Multi-strategy depth measurement:
+ * 1. Try Camera2 API on ANY camera that outputs DEPTH16
+ * 2. Fall back to ARCore raw depth (ToF via ARCore)
+ * 3. Fall back to ARCore processed depth (stereo)
  */
 class ArCoreDepthModule(reactContext: ReactApplicationContext) :
     ReactContextBaseJavaModule(reactContext) {
@@ -35,335 +39,487 @@ class ArCoreDepthModule(reactContext: ReactApplicationContext) :
     companion object {
         const val NAME = "ArCoreDepthModule"
         const val TAG = "DepthSensor"
-        const val CENTER_RATIO = 0.4f      // Use center 40% of depth image
-        const val DEPTH_FRAME_COUNT = 5    // Frames to collect
-        const val TIMEOUT_SECONDS = 10L    // Max wait time
+        const val CENTER_RATIO = 0.4f
     }
 
     override fun getName(): String = NAME
 
-    /**
-     * Check if this device has a depth (ToF) camera.
-     */
     @ReactMethod
     fun checkDepthSupport(promise: Promise) {
         try {
-            val depthCameraId = findDepthCamera()
-            promise.resolve(depthCameraId != null)
+            // Check Camera2 depth cameras OR ARCore support
+            val depthCamera = findAnyDepthCamera()
+            if (depthCamera != null) {
+                promise.resolve(true)
+                return
+            }
+
+            // Check ARCore
+            val activity: Activity? = reactApplicationContext.currentActivity
+            if (activity != null) {
+                val availability = ArCoreApk.getInstance().checkAvailability(activity as Context)
+                if (availability.isSupported) {
+                    promise.resolve(true)
+                    return
+                }
+            }
+            promise.resolve(false)
         } catch (e: Exception) {
-            Log.e(TAG, "Error checking depth support", e)
             promise.resolve(false)
         }
     }
 
     /**
-     * Find the depth/ToF camera ID.
+     * Diagnostic: list ALL cameras and their depth capabilities.
+     * Returns a readable string with all info.
      */
-    private fun findDepthCamera(): String? {
-        val cameraManager = reactApplicationContext.getSystemService(Context.CAMERA_SERVICE) as CameraManager
+    @ReactMethod
+    fun diagnoseDepthSensors(promise: Promise) {
+        try {
+            val cameraManager = reactApplicationContext.getSystemService(Context.CAMERA_SERVICE) as CameraManager
+            val sb = StringBuilder()
 
-        for (cameraId in cameraManager.cameraIdList) {
-            val chars = cameraManager.getCameraCharacteristics(cameraId)
-            val capabilities = chars.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES) ?: continue
+            for (cameraId in cameraManager.cameraIdList) {
+                val chars = cameraManager.getCameraCharacteristics(cameraId)
+                val facing = chars.get(CameraCharacteristics.LENS_FACING)
+                val facingStr = when (facing) {
+                    CameraCharacteristics.LENS_FACING_BACK -> "BACK"
+                    CameraCharacteristics.LENS_FACING_FRONT -> "FRONT"
+                    CameraCharacteristics.LENS_FACING_EXTERNAL -> "EXTERNAL"
+                    else -> "UNKNOWN"
+                }
 
-            if (capabilities.contains(CameraMetadata.REQUEST_AVAILABLE_CAPABILITIES_DEPTH_OUTPUT)) {
-                // Check it supports DEPTH16 format
+                val capabilities = chars.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES) ?: intArrayOf()
+                val capNames = capabilities.map { cap ->
+                    when (cap) {
+                        0 -> "BACKWARD_COMPATIBLE"
+                        1 -> "MANUAL_SENSOR"
+                        2 -> "MANUAL_POST_PROCESSING"
+                        3 -> "RAW"
+                        4 -> "PRIVATE_REPROCESSING"
+                        5 -> "READ_SENSOR_SETTINGS"
+                        6 -> "BURST_CAPTURE"
+                        7 -> "YUV_REPROCESSING"
+                        8 -> "DEPTH_OUTPUT"
+                        9 -> "CONSTRAINED_HIGH_SPEED"
+                        10 -> "MOTION_TRACKING"
+                        11 -> "LOGICAL_MULTI_CAMERA"
+                        12 -> "MONOCHROME"
+                        13 -> "SECURE_IMAGE"
+                        14 -> "SYSTEM_CAMERA"
+                        15 -> "OFFLINE_PROCESSING"
+                        else -> "CAP_$cap"
+                    }
+                }
+
+                val streamConfigMap = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+                val depth16Sizes = streamConfigMap?.getOutputSizes(ImageFormat.DEPTH16)
+                val depth16Str = depth16Sizes?.joinToString(", ") { "${it.width}x${it.height}" } ?: "NONE"
+
+                val depthPointSizes = try {
+                    streamConfigMap?.getOutputSizes(ImageFormat.DEPTH_POINT_CLOUD)
+                } catch (_: Exception) { null }
+                val depthPointStr = depthPointSizes?.joinToString(", ") { "${it.width}x${it.height}" } ?: "NONE"
+
+                sb.appendLine("Camera $cameraId ($facingStr):")
+                sb.appendLine("  Capabilities: $capNames")
+                sb.appendLine("  DEPTH16 sizes: $depth16Str")
+                sb.appendLine("  DEPTH_POINT_CLOUD: $depthPointStr")
+                sb.appendLine()
+            }
+
+            Log.d(TAG, "Camera diagnostics:\n$sb")
+            promise.resolve(sb.toString())
+        } catch (e: Exception) {
+            promise.reject("ERROR", e.message)
+        }
+    }
+
+    /**
+     * Find ANY camera that supports DEPTH16 output (not just ones with DEPTH_OUTPUT capability).
+     */
+    private fun findAnyDepthCamera(): Pair<String, Size>? {
+        try {
+            val cameraManager = reactApplicationContext.getSystemService(Context.CAMERA_SERVICE) as CameraManager
+
+            for (cameraId in cameraManager.cameraIdList) {
+                val chars = cameraManager.getCameraCharacteristics(cameraId)
                 val streamConfigMap = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP) ?: continue
-                val depthSizes = streamConfigMap.getOutputSizes(ImageFormat.DEPTH16)
+
+                val depthSizes = try {
+                    streamConfigMap.getOutputSizes(ImageFormat.DEPTH16)
+                } catch (_: Exception) { null }
+
                 if (depthSizes != null && depthSizes.isNotEmpty()) {
+                    val bestSize = depthSizes.maxByOrNull { it.width * it.height }!!
                     Log.d(TAG, "Found depth camera: $cameraId, sizes: ${depthSizes.map { "${it.width}x${it.height}" }}")
-                    return cameraId
+                    return Pair(cameraId, bestSize)
                 }
             }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error scanning cameras", e)
         }
-
-        Log.w(TAG, "No depth camera found on this device")
         return null
     }
 
     /**
-     * Measure depth using the ToF sensor directly via Camera2 API.
-     * Returns: { averageDistance, minDistance, maxDistance, framesUsed, totalPixels }
+     * Main measurement function — tries Camera2 first, then ARCore.
      */
     @ReactMethod
     fun measureDepth(promise: Promise) {
         Thread {
-            var handlerThread: HandlerThread? = null
-            var cameraDevice: CameraDevice? = null
-            var imageReader: ImageReader? = null
-            var captureSession: CameraCaptureSession? = null
-
-            try {
-                val depthCameraId = findDepthCamera()
-                if (depthCameraId == null) {
-                    promise.reject("NO_SENSOR", "No ToF/depth sensor found on this device")
-                    return@Thread
-                }
-
-                val cameraManager = reactApplicationContext.getSystemService(Context.CAMERA_SERVICE) as CameraManager
-                val chars = cameraManager.getCameraCharacteristics(depthCameraId)
-
-                // Check camera permission
-                if (ActivityCompat.checkSelfPermission(reactApplicationContext, Manifest.permission.CAMERA)
-                    != PackageManager.PERMISSION_GRANTED) {
-                    promise.reject("NO_PERMISSION", "Camera permission not granted")
-                    return@Thread
-                }
-
-                // Get the best depth output size
-                val streamConfigMap = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)!!
-                val depthSizes = streamConfigMap.getOutputSizes(ImageFormat.DEPTH16)!!
-                val depthSize = depthSizes.maxByOrNull { it.width * it.height }
-                    ?: throw Exception("No depth sizes available")
-
-                Log.d(TAG, "Using depth size: ${depthSize.width}x${depthSize.height}")
-
-                // Create handler thread for camera callbacks
-                handlerThread = HandlerThread("DepthThread").also { it.start() }
-                val handler = Handler(handlerThread.looper)
-
-                // Create ImageReader for depth frames
-                imageReader = ImageReader.newInstance(
-                    depthSize.width, depthSize.height,
-                    ImageFormat.DEPTH16, DEPTH_FRAME_COUNT + 2
-                )
-
-                // Collect depth frames
-                val depthFrames = mutableListOf<Image>()
-                val framesLatch = CountDownLatch(DEPTH_FRAME_COUNT)
-
-                imageReader.setOnImageAvailableListener({ reader ->
-                    val image = reader.acquireLatestImage() ?: return@setOnImageAvailableListener
-                    synchronized(depthFrames) {
-                        if (depthFrames.size < DEPTH_FRAME_COUNT) {
-                            depthFrames.add(image)
-                            framesLatch.countDown()
-                            Log.d(TAG, "Captured depth frame ${depthFrames.size}/${DEPTH_FRAME_COUNT}")
-                        } else {
-                            image.close()
-                        }
-                    }
-                }, handler)
-
-                // Open camera
-                val cameraLatch = CountDownLatch(1)
-                val cameraRef = AtomicReference<CameraDevice?>(null)
-                val cameraError = AtomicReference<String?>(null)
-
-                cameraManager.openCamera(depthCameraId, object : CameraDevice.StateCallback() {
-                    override fun onOpened(camera: CameraDevice) {
-                        cameraRef.set(camera)
-                        cameraLatch.countDown()
-                    }
-
-                    override fun onDisconnected(camera: CameraDevice) {
-                        cameraError.set("Camera disconnected")
-                        cameraLatch.countDown()
-                    }
-
-                    override fun onError(camera: CameraDevice, error: Int) {
-                        cameraError.set("Camera error: $error")
-                        cameraLatch.countDown()
-                    }
-                }, handler)
-
-                if (!cameraLatch.await(TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
-                    promise.reject("TIMEOUT", "Timed out opening depth camera")
-                    return@Thread
-                }
-
-                cameraDevice = cameraRef.get()
-                if (cameraDevice == null || cameraError.get() != null) {
-                    promise.reject("CAMERA_ERROR", cameraError.get() ?: "Failed to open depth camera")
-                    return@Thread
-                }
-
-                Log.d(TAG, "Depth camera opened successfully")
-
-                // Create capture session
-                val sessionLatch = CountDownLatch(1)
-                val sessionRef = AtomicReference<CameraCaptureSession?>(null)
-                val sessionError = AtomicReference<String?>(null)
-
-                cameraDevice.createCaptureSession(
-                    listOf(imageReader.surface),
-                    object : CameraCaptureSession.StateCallback() {
-                        override fun onConfigured(session: CameraCaptureSession) {
-                            sessionRef.set(session)
-                            sessionLatch.countDown()
-                        }
-
-                        override fun onConfigureFailed(session: CameraCaptureSession) {
-                            sessionError.set("Session configuration failed")
-                            sessionLatch.countDown()
-                        }
-                    },
-                    handler
-                )
-
-                if (!sessionLatch.await(TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
-                    promise.reject("TIMEOUT", "Timed out creating capture session")
-                    return@Thread
-                }
-
-                captureSession = sessionRef.get()
-                if (captureSession == null || sessionError.get() != null) {
-                    promise.reject("SESSION_ERROR", sessionError.get() ?: "Failed to create session")
-                    return@Thread
-                }
-
-                Log.d(TAG, "Capture session created, starting repeating request")
-
-                // Start capturing
-                val captureRequest = cameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
-                    addTarget(imageReader.surface)
-                }.build()
-
-                captureSession.setRepeatingRequest(captureRequest, null, handler)
-
-                // Wait for frames
-                if (!framesLatch.await(TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
-                    Log.w(TAG, "Only got ${depthFrames.size}/${DEPTH_FRAME_COUNT} frames before timeout")
-                }
-
-                // Stop capturing
-                try { captureSession.stopRepeating() } catch (_: Exception) {}
-
-                // Process collected frames
-                if (depthFrames.isEmpty()) {
-                    promise.reject("NO_DEPTH", "No depth frames captured")
-                    return@Thread
-                }
-
-                Log.d(TAG, "Processing ${depthFrames.size} depth frames...")
-
-                val frameMedians = mutableListOf<Double>()
-                var globalMin = Double.MAX_VALUE
-                var globalMax = 0.0
-                var totalPixels: Long = 0
-
-                synchronized(depthFrames) {
-                    for (image in depthFrames) {
-                        try {
-                            val result = processDepthFrame(image)
-                            if (result != null) {
-                                frameMedians.add(result.median)
-                                if (result.min < globalMin) globalMin = result.min
-                                if (result.max > globalMax) globalMax = result.max
-                                totalPixels += result.pixelCount
-                                Log.d(TAG, "Frame result: median=${String.format("%.3f", result.median)}m " +
-                                    "min=${String.format("%.3f", result.min)}m " +
-                                    "max=${String.format("%.3f", result.max)}m " +
-                                    "(${result.pixelCount} pixels)")
-                            }
-                        } finally {
-                            image.close()
-                        }
-                    }
-                    depthFrames.clear()
-                }
-
-                if (frameMedians.isEmpty()) {
-                    promise.reject("NO_VALID_DEPTH", "No valid depth data in captured frames")
-                    return@Thread
-                }
-
-                // Median of medians
-                frameMedians.sort()
-                val finalDistance = if (frameMedians.size % 2 == 0) {
-                    (frameMedians[frameMedians.size / 2 - 1] + frameMedians[frameMedians.size / 2]) / 2.0
-                } else {
-                    frameMedians[frameMedians.size / 2]
-                }
-
-                Log.d(TAG, "FINAL: distance=${String.format("%.3f", finalDistance)}m from ${frameMedians.size} frames")
-
-                val result = Arguments.createMap().apply {
-                    putDouble("averageDistance", finalDistance)
-                    putDouble("minDistance", if (globalMin == Double.MAX_VALUE) 0.0 else globalMin)
-                    putDouble("maxDistance", globalMax)
-                    putInt("framesUsed", frameMedians.size)
-                    putDouble("totalPixels", totalPixels.toDouble())
-                }
-                promise.resolve(result)
-
-            } catch (e: SecurityException) {
-                promise.reject("NO_PERMISSION", "Camera permission required: ${e.message}")
-            } catch (e: Exception) {
-                promise.reject("ERROR", "${e.javaClass.simpleName}: ${e.message}")
-            } finally {
-                try { captureSession?.close() } catch (_: Exception) {}
-                try { cameraDevice?.close() } catch (_: Exception) {}
-                try { imageReader?.close() } catch (_: Exception) {}
-                handlerThread?.quitSafely()
-                Log.d(TAG, "Cleaned up depth resources")
+            // Strategy 1: Camera2 direct depth
+            val camera2Result = tryCamera2Depth()
+            if (camera2Result != null) {
+                promise.resolve(camera2Result)
+                return@Thread
             }
+
+            Log.d(TAG, "Camera2 depth not available, trying ARCore...")
+
+            // Strategy 2: ARCore depth
+            val arCoreResult = tryARCoreDepth()
+            if (arCoreResult != null) {
+                promise.resolve(arCoreResult)
+                return@Thread
+            }
+
+            promise.reject("NO_DEPTH", "Could not measure depth with any method")
         }.start()
     }
 
-    data class FrameResult(
-        val median: Double,
-        val min: Double,
-        val max: Double,
-        val pixelCount: Int
-    )
+    // ======== STRATEGY 1: Camera2 Direct Depth ========
+
+    private fun tryCamera2Depth(): WritableMap? {
+        val depthInfo = findAnyDepthCamera() ?: return null
+        val cameraId = depthInfo.first
+        val depthSize = depthInfo.second
+
+        var handlerThread: HandlerThread? = null
+        var cameraDevice: CameraDevice? = null
+        var imageReader: ImageReader? = null
+        var captureSession: CameraCaptureSession? = null
+
+        try {
+            if (ActivityCompat.checkSelfPermission(reactApplicationContext, Manifest.permission.CAMERA)
+                != PackageManager.PERMISSION_GRANTED) {
+                return null
+            }
+
+            val cameraManager = reactApplicationContext.getSystemService(Context.CAMERA_SERVICE) as CameraManager
+
+            handlerThread = HandlerThread("DepthThread").also { it.start() }
+            val handler = Handler(handlerThread.looper)
+
+            imageReader = ImageReader.newInstance(depthSize.width, depthSize.height, ImageFormat.DEPTH16, 8)
+
+            val depthFrames = mutableListOf<ShortArray>()
+            val frameWidth = depthSize.width
+            val frameHeight = depthSize.height
+            val framesLatch = CountDownLatch(5)
+
+            imageReader.setOnImageAvailableListener({ reader ->
+                val image = reader.acquireLatestImage() ?: return@setOnImageAvailableListener
+                try {
+                    synchronized(depthFrames) {
+                        if (depthFrames.size < 5) {
+                            // Copy buffer data before closing image
+                            val buffer = image.planes[0].buffer.asShortBuffer()
+                            val data = ShortArray(buffer.remaining())
+                            buffer.get(data)
+                            depthFrames.add(data)
+                            framesLatch.countDown()
+                        }
+                    }
+                } finally {
+                    image.close()
+                }
+            }, handler)
+
+            // Open camera
+            val cameraLatch = CountDownLatch(1)
+            val cameraRef = AtomicReference<CameraDevice?>(null)
+
+            cameraManager.openCamera(cameraId, object : CameraDevice.StateCallback() {
+                override fun onOpened(camera: CameraDevice) { cameraRef.set(camera); cameraLatch.countDown() }
+                override fun onDisconnected(camera: CameraDevice) { cameraLatch.countDown() }
+                override fun onError(camera: CameraDevice, error: Int) { cameraLatch.countDown() }
+            }, handler)
+
+            if (!cameraLatch.await(8, TimeUnit.SECONDS)) return null
+            cameraDevice = cameraRef.get() ?: return null
+
+            // Create session
+            val sessionLatch = CountDownLatch(1)
+            val sessionRef = AtomicReference<CameraCaptureSession?>(null)
+
+            cameraDevice.createCaptureSession(
+                listOf(imageReader.surface),
+                object : CameraCaptureSession.StateCallback() {
+                    override fun onConfigured(session: CameraCaptureSession) { sessionRef.set(session); sessionLatch.countDown() }
+                    override fun onConfigureFailed(session: CameraCaptureSession) { sessionLatch.countDown() }
+                },
+                handler
+            )
+
+            if (!sessionLatch.await(8, TimeUnit.SECONDS)) return null
+            captureSession = sessionRef.get() ?: return null
+
+            // Capture
+            val request = cameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
+                .apply { addTarget(imageReader.surface) }.build()
+            captureSession.setRepeatingRequest(request, null, handler)
+
+            framesLatch.await(8, TimeUnit.SECONDS)
+            try { captureSession.stopRepeating() } catch (_: Exception) {}
+
+            // Process frames
+            if (depthFrames.isEmpty()) return null
+
+            return processCamera2Frames(depthFrames, frameWidth, frameHeight)
+        } catch (e: Exception) {
+            Log.e(TAG, "Camera2 depth error: ${e.message}", e)
+            return null
+        } finally {
+            try { captureSession?.close() } catch (_: Exception) {}
+            try { cameraDevice?.close() } catch (_: Exception) {}
+            try { imageReader?.close() } catch (_: Exception) {}
+            handlerThread?.quitSafely()
+        }
+    }
+
+    private fun processCamera2Frames(frames: List<ShortArray>, width: Int, height: Int): WritableMap? {
+        val frameMedians = mutableListOf<Double>()
+        var globalMin = Double.MAX_VALUE
+        var globalMax = 0.0
+        var totalPixels: Long = 0
+
+        for (data in frames) {
+            val result = processDepthData(data, width, height, isCamera2 = true) ?: continue
+            frameMedians.add(result.median)
+            if (result.min < globalMin) globalMin = result.min
+            if (result.max > globalMax) globalMax = result.max
+            totalPixels += result.pixelCount
+            Log.d(TAG, "Camera2 frame: median=${String.format("%.3f", result.median)}m (${result.pixelCount}px)")
+        }
+
+        if (frameMedians.isEmpty()) return null
+
+        frameMedians.sort()
+        val finalDist = frameMedians[frameMedians.size / 2]
+
+        Log.d(TAG, "Camera2 FINAL: ${String.format("%.3f", finalDist)}m")
+        return Arguments.createMap().apply {
+            putDouble("averageDistance", finalDist)
+            putDouble("minDistance", if (globalMin == Double.MAX_VALUE) 0.0 else globalMin)
+            putDouble("maxDistance", globalMax)
+            putInt("framesUsed", frameMedians.size)
+            putDouble("totalPixels", totalPixels.toDouble())
+            putString("method", "Camera2 ToF")
+        }
+    }
+
+    // ======== STRATEGY 2: ARCore Depth ========
+
+    private fun tryARCoreDepth(): WritableMap? {
+        var eglDisplay: EGLDisplay? = null
+        var eglContext: EGLContext? = null
+        var eglSurface: EGLSurface? = null
+        var session: Session? = null
+        var textureId = -1
+
+        try {
+            val activity: Activity? = reactApplicationContext.currentActivity ?: return null
+
+            // EGL setup
+            eglDisplay = EGL14.eglGetDisplay(EGL14.EGL_DEFAULT_DISPLAY)
+            val version = IntArray(2)
+            EGL14.eglInitialize(eglDisplay, version, 0, version, 1)
+
+            val configAttribs = intArrayOf(
+                EGL14.EGL_RED_SIZE, 8, EGL14.EGL_GREEN_SIZE, 8,
+                EGL14.EGL_BLUE_SIZE, 8, EGL14.EGL_ALPHA_SIZE, 8,
+                EGL14.EGL_RENDERABLE_TYPE, EGL14.EGL_OPENGL_ES2_BIT,
+                EGL14.EGL_SURFACE_TYPE, EGL14.EGL_PBUFFER_BIT, EGL14.EGL_NONE
+            )
+            val configs = arrayOfNulls<EGLConfig>(1)
+            val numConfigs = IntArray(1)
+            EGL14.eglChooseConfig(eglDisplay, configAttribs, 0, configs, 0, 1, numConfigs, 0)
+
+            eglContext = EGL14.eglCreateContext(eglDisplay, configs[0]!!,
+                EGL14.EGL_NO_CONTEXT, intArrayOf(EGL14.EGL_CONTEXT_CLIENT_VERSION, 2, EGL14.EGL_NONE), 0)
+            eglSurface = EGL14.eglCreatePbufferSurface(eglDisplay, configs[0]!!,
+                intArrayOf(EGL14.EGL_WIDTH, 1, EGL14.EGL_HEIGHT, 1, EGL14.EGL_NONE), 0)
+            EGL14.eglMakeCurrent(eglDisplay, eglSurface, eglSurface, eglContext)
+
+            val textures = IntArray(1)
+            GLES20.glGenTextures(1, textures, 0)
+            textureId = textures[0]
+
+            // ARCore session
+            session = Session(activity as Context)
+            val config = Config(session)
+            config.depthMode = Config.DepthMode.AUTOMATIC
+            config.updateMode = Config.UpdateMode.LATEST_CAMERA_IMAGE
+            session.configure(config)
+            session.setCameraTextureName(textureId)
+            session.resume()
+
+            // Give ARCore much more time to track (5 seconds)
+            Log.d(TAG, "ARCore: Waiting 5s for tracking...")
+            Thread.sleep(5000)
+
+            // Try to get good frames
+            val frameMedians = mutableListOf<Double>()
+            var globalMin = Double.MAX_VALUE
+            var globalMax = 0.0
+            var totalPixels: Long = 0
+            var attempts = 0
+            val maxAttempts = 100
+            val targetFrames = 5
+
+            while (frameMedians.size < targetFrames && attempts < maxAttempts) {
+                attempts++
+                try {
+                    val frame = session.update()
+                    if (frame.camera.trackingState != TrackingState.TRACKING) {
+                        Thread.sleep(100)
+                        continue
+                    }
+
+                    // Try raw depth first (uses ToF if available)
+                    var result = tryARCoreRawDepth(frame)
+                    val method = if (result != null) "ARCore Raw/ToF" else {
+                        result = tryARCoreProcessedDepth(frame)
+                        "ARCore Stereo"
+                    }
+
+                    if (result != null) {
+                        frameMedians.add(result.median)
+                        if (result.min < globalMin) globalMin = result.min
+                        if (result.max > globalMax) globalMax = result.max
+                        totalPixels += result.pixelCount
+                        Log.d(TAG, "$method frame ${frameMedians.size}: " +
+                            "median=${String.format("%.3f", result.median)}m " +
+                            "min=${String.format("%.3f", result.min)}m " +
+                            "(${result.pixelCount}px)")
+                    }
+
+                    Thread.sleep(100)
+                } catch (e: Exception) {
+                    Thread.sleep(200)
+                }
+            }
+
+            if (frameMedians.isEmpty()) return null
+
+            frameMedians.sort()
+            val finalDist = frameMedians[frameMedians.size / 2]
+
+            Log.d(TAG, "ARCore FINAL: ${String.format("%.3f", finalDist)}m from ${frameMedians.size} frames")
+            return Arguments.createMap().apply {
+                putDouble("averageDistance", finalDist)
+                putDouble("minDistance", if (globalMin == Double.MAX_VALUE) 0.0 else globalMin)
+                putDouble("maxDistance", globalMax)
+                putInt("framesUsed", frameMedians.size)
+                putDouble("totalPixels", totalPixels.toDouble())
+                putString("method", "ARCore")
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "ARCore depth error: ${e.message}", e)
+            return null
+        } finally {
+            try { session?.pause() } catch (_: Exception) {}
+            try { session?.close() } catch (_: Exception) {}
+            if (textureId != -1) try { GLES20.glDeleteTextures(1, intArrayOf(textureId), 0) } catch (_: Exception) {}
+            if (eglDisplay != null && eglDisplay != EGL14.EGL_NO_DISPLAY) {
+                EGL14.eglMakeCurrent(eglDisplay, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_CONTEXT)
+                eglSurface?.let { EGL14.eglDestroySurface(eglDisplay, it) }
+                eglContext?.let { EGL14.eglDestroyContext(eglDisplay, it) }
+                EGL14.eglTerminate(eglDisplay)
+            }
+        }
+    }
+
+    private fun tryARCoreRawDepth(frame: Frame): FrameResult? {
+        var depthImage: Image? = null
+        var confImage: Image? = null
+        try {
+            depthImage = frame.acquireRawDepthImage()
+            confImage = frame.acquireRawDepthConfidenceImage()
+            val w = depthImage.width
+            val h = depthImage.height
+            val buffer = depthImage.planes[0].buffer.asShortBuffer()
+            val rowStride = depthImage.planes[0].rowStride / 2
+            val data = ShortArray(buffer.remaining())
+            buffer.get(data)
+            return processDepthData(data, w, h, isCamera2 = false, rowStride = rowStride)
+        } catch (_: NotYetAvailableException) { return null
+        } catch (_: Exception) { return null
+        } finally {
+            depthImage?.close()
+            confImage?.close()
+        }
+    }
+
+    private fun tryARCoreProcessedDepth(frame: Frame): FrameResult? {
+        var depthImage: Image? = null
+        try {
+            depthImage = frame.acquireDepthImage()
+            val w = depthImage.width
+            val h = depthImage.height
+            val buffer = depthImage.planes[0].buffer.asShortBuffer()
+            val rowStride = depthImage.planes[0].rowStride / 2
+            val data = ShortArray(buffer.remaining())
+            buffer.get(data)
+            return processDepthData(data, w, h, isCamera2 = false, rowStride = rowStride)
+        } catch (_: NotYetAvailableException) { return null
+        } catch (_: Exception) { return null
+        } finally {
+            depthImage?.close()
+        }
+    }
+
+    // ======== Shared Processing ========
+
+    data class FrameResult(val median: Double, val min: Double, val max: Double, val pixelCount: Int)
 
     /**
-     * Process a single DEPTH16 frame.
-     * Reads center region, filters by confidence, returns median depth.
-     *
-     * DEPTH16 format: each pixel is 16 bits
-     * - Lower 13 bits: depth in millimeters
-     * - Upper 3 bits: confidence (0=low, 7=high)
+     * Process depth pixel data.
+     * @param isCamera2 true = DEPTH16 with confidence bits, false = raw mm values (ARCore)
      */
-    private fun processDepthFrame(image: Image): FrameResult? {
-        val width = image.width
-        val height = image.height
-        val plane = image.planes[0]
-        val buffer: ShortBuffer = plane.buffer.asShortBuffer()
-        val pixelStride = plane.pixelStride / 2  // Convert bytes to shorts
-        val rowStride = plane.rowStride / 2       // Convert bytes to shorts
-
-        // Center region bounds
+    private fun processDepthData(
+        data: ShortArray,
+        width: Int,
+        height: Int,
+        isCamera2: Boolean,
+        rowStride: Int = width
+    ): FrameResult? {
         val marginX = ((1.0f - CENTER_RATIO) / 2 * width).toInt()
         val marginY = ((1.0f - CENTER_RATIO) / 2 * height).toInt()
-        val startX = marginX
-        val endX = width - marginX
-        val startY = marginY
-        val endY = height - marginY
 
         val depthValues = mutableListOf<Double>()
 
-        for (y in startY until endY) {
-            for (x in startX until endX) {
-                val index = y * rowStride + x * maxOf(pixelStride, 1)
-                if (index >= 0 && index < buffer.limit()) {
-                    val rawValue = buffer.get(index).toInt() and 0xFFFF
+        for (y in marginY until (height - marginY)) {
+            for (x in marginX until (width - marginX)) {
+                val index = y * rowStride + x
+                if (index < 0 || index >= data.size) continue
 
-                    // Extract depth and confidence from DEPTH16
-                    val depthMm = rawValue and 0x1FFF          // Lower 13 bits
-                    val confidence = (rawValue shr 13) and 0x7  // Upper 3 bits
+                val rawValue = data[index].toInt() and 0xFFFF
 
-                    // Only use high-confidence pixels with valid depth
-                    if (confidence >= 1 && depthMm in 30..5000) { // 3cm to 5m
-                        depthValues.add(depthMm / 1000.0)
-                    }
+                val depthMm: Int
+                if (isCamera2) {
+                    // Camera2 DEPTH16: lower 13 bits = depth, upper 3 = confidence
+                    depthMm = rawValue and 0x1FFF
+                    val confidence = (rawValue shr 13) and 0x7
+                    if (confidence < 1) continue
+                } else {
+                    // ARCore: full 16 bits = depth in mm
+                    depthMm = rawValue
                 }
-            }
-        }
 
-        if (depthValues.isEmpty()) {
-            // Try without confidence filter (some sensors encode differently)
-            for (y in startY until endY) {
-                for (x in startX until endX) {
-                    val index = y * rowStride + x * maxOf(pixelStride, 1)
-                    if (index >= 0 && index < buffer.limit()) {
-                        val rawValue = buffer.get(index).toInt() and 0xFFFF
-                        // Treat full 16 bits as depth in mm
-                        if (rawValue in 30..5000) {
-                            depthValues.add(rawValue / 1000.0)
-                        }
-                    }
+                if (depthMm in 30..5000) { // 3cm to 5m
+                    depthValues.add(depthMm / 1000.0)
                 }
             }
         }
@@ -371,10 +527,12 @@ class ArCoreDepthModule(reactContext: ReactApplicationContext) :
         if (depthValues.isEmpty()) return null
 
         depthValues.sort()
-        val median = depthValues[depthValues.size / 2]
+        // Use 25th percentile instead of median — closer to the nearest surface
+        val p25Index = depthValues.size / 4
+        val distance = depthValues[p25Index]
 
         return FrameResult(
-            median = median,
+            median = distance,
             min = depthValues.first(),
             max = depthValues.last(),
             pixelCount = depthValues.size
