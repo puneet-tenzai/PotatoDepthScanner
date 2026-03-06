@@ -4,11 +4,14 @@ const { ArCoreDepthModule } = NativeModules;
 
 export interface DepthResult {
   averageDistance: number;
+  rawDistance: number;
   minDistance: number;
   maxDistance: number;
   framesUsed: number;
   totalPixels: number;
-  method?: string;  // "Camera2 ToF" or "ARCore"
+  method?: string;
+  tooFar?: boolean;
+  calibrationFactor?: number;
 }
 
 export async function isDepthSupported(): Promise<boolean> {

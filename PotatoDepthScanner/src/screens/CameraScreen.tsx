@@ -165,14 +165,27 @@ export const CameraScreen: React.FC = () => {
                 {/* Depth measurement result */}
                 {depthResult && (
                     <View style={styles.depthResultContainer}>
-                        <View style={styles.depthResultCard}>
-                            <Text style={styles.depthResultLabel}>DISTANCE TO GROUND</Text>
-                            <Text style={styles.depthResultValue}>
+                        <View style={[
+                            styles.depthResultCard,
+                            depthResult.tooFar && styles.depthResultCardError
+                        ]}>
+                            <Text style={styles.depthResultLabel}>
+                                {depthResult.tooFar ? '⚠️ TOO FAR' : 'DISTANCE TO GROUND'}
+                            </Text>
+                            <Text style={[
+                                styles.depthResultValue,
+                                depthResult.tooFar && { color: '#FF6B6B' }
+                            ]}>
                                 {depthResult.averageDistance.toFixed(2)} m
                             </Text>
                             <Text style={styles.depthResultFeet}>
                                 ≈ {(depthResult.averageDistance * 3.281).toFixed(1)} ft
                             </Text>
+                            {depthResult.tooFar && (
+                                <Text style={{ color: '#FF6B6B', fontSize: 12, textAlign: 'center', marginTop: 4 }}>
+                                    Max distance is 5 ft. Move closer.
+                                </Text>
+                            )}
                             <View style={styles.depthDetails}>
                                 <Text style={styles.depthDetailText}>
                                     Min: {depthResult.minDistance.toFixed(2)}m
@@ -182,7 +195,7 @@ export const CameraScreen: React.FC = () => {
                                 </Text>
                             </View>
                             <Text style={styles.depthFrameInfo}>
-                                {depthResult.framesUsed} frames • {depthResult.method || 'unknown'}
+                                {depthResult.framesUsed} readings • {depthResult.method || 'unknown'}
                             </Text>
                         </View>
                     </View>
@@ -203,10 +216,10 @@ export const CameraScreen: React.FC = () => {
                 {isMeasuring && (
                     <View style={styles.depthResultContainer}>
                         <View style={styles.depthResultCard}>
-                            <Text style={styles.depthResultLabel}>MEASURING DEPTH...</Text>
+                            <Text style={styles.depthResultLabel}>MEASURING DISTANCE...</Text>
                             <Text style={styles.depthMeasuring}>⏳</Text>
                             <Text style={styles.depthDetailText}>
-                                Processing with ARCore
+                                Autofocusing on subject (~5s)
                             </Text>
                         </View>
                     </View>
