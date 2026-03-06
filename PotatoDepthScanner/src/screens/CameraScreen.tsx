@@ -67,7 +67,7 @@ export const CameraScreen: React.FC = () => {
 
             // Step 4: Wait for camera hardware to fully release (3 seconds)
             setIsMeasuring(true);
-            await new Promise<void>(resolve => setTimeout(() => resolve(), 3000));
+            await new Promise<void>(resolve => setTimeout(() => resolve(), 2000));
 
             // Step 5: Measure depth with ARCore
             try {

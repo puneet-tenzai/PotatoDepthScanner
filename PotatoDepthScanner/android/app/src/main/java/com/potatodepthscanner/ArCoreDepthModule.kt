@@ -17,13 +17,10 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
 
 /**
- * High-accuracy distance measurement using Camera2 autofocus PDAF.
+ * Distance measurement using Camera2 autofocus PDAF.
  *
- * Improvements for accuracy:
- * - 3 separate AF trigger cycles, 10 readings each = 30 total readings
- * - Trims outliers (keeps middle 60%)
- * - Applies Samsung S24 calibration correction
- * - Validates max distance (5 feet = 1.52m)
+ * Uses piecewise linear calibration curve built from real-world test data
+ * on Samsung Galaxy S24. Fast: 2 AF cycles, ~5 seconds total.
  */
 class ArCoreDepthModule(reactContext: ReactApplicationContext) :
     ReactContextBaseJavaModule(reactContext) {
@@ -31,20 +28,37 @@ class ArCoreDepthModule(reactContext: ReactApplicationContext) :
     companion object {
         const val NAME = "ArCoreDepthModule"
         const val TAG = "DepthSensor"
-        const val AF_CYCLES = 3            // Number of AF trigger cycles
-        const val READINGS_PER_CYCLE = 10  // Readings per cycle
-        const val MAX_DISTANCE_M = 1.52    // 5 feet in meters
+        const val AF_CYCLES = 2            // Reduced from 3 for speed
+        const val READINGS_PER_CYCLE = 8   // Reduced from 10 for speed
+        const val MAX_DISTANCE_M = 1.52    // 5 feet
 
-        // Calibration: Samsung S24 PDAF typically underreports by ~1.6x
-        // This can be fine-tuned after testing at multiple known distances
-        const val CALIBRATION_FACTOR = 1.6
+        /**
+         * Calibration data from real-world measurements on Samsung S24.
+         * Format: Pair(raw_diopter_distance_meters, actual_distance_meters)
+         *
+         * Raw values derived from user test (displayed / 1.6 calibration factor):
+         *   Actual 0.5ft (0.152m) → measured showed 1.1ft (0.335m) → raw = 0.209m
+         *   Actual 1.0ft (0.305m) → measured showed 1.4ft (0.427m) → raw = 0.267m
+         *   Actual 2.0ft (0.610m) → measured showed 2.2ft (0.670m) → raw = 0.419m
+         *   Actual 3.0ft (0.914m) → measured showed 3.2ft (0.975m) → raw = 0.609m
+         *   Actual 4.0ft (1.219m) → measured showed 4.2ft (1.280m) → raw = 0.800m
+         *   Actual 5.0ft (1.524m) → measured showed 4.6ft (1.402m) → raw = 0.876m
+         */
+        val CALIBRATION_TABLE = listOf(
+            Pair(0.209, 0.152),   // 0.5 ft
+            Pair(0.267, 0.305),   // 1.0 ft
+            Pair(0.419, 0.610),   // 2.0 ft
+            Pair(0.609, 0.914),   // 3.0 ft
+            Pair(0.800, 1.219),   // 4.0 ft
+            Pair(0.876, 1.524),   // 5.0 ft
+        )
     }
 
     override fun getName(): String = NAME
 
     @ReactMethod
     fun checkDepthSupport(promise: Promise) {
-        promise.resolve(true) // PDAF works on all modern phones
+        promise.resolve(true)
     }
 
     @ReactMethod
@@ -52,7 +66,6 @@ class ArCoreDepthModule(reactContext: ReactApplicationContext) :
         try {
             val cameraManager = reactApplicationContext.getSystemService(Context.CAMERA_SERVICE) as CameraManager
             val sb = StringBuilder()
-
             for (cameraId in cameraManager.cameraIdList) {
                 val chars = cameraManager.getCameraCharacteristics(cameraId)
                 val facing = when (chars.get(CameraCharacteristics.LENS_FACING)) {
@@ -60,35 +73,50 @@ class ArCoreDepthModule(reactContext: ReactApplicationContext) :
                     CameraCharacteristics.LENS_FACING_FRONT -> "FRONT"
                     else -> "OTHER"
                 }
-                val afModes = chars.get(CameraCharacteristics.CONTROL_AF_AVAILABLE_MODES) ?: intArrayOf()
-                val hasAF = afModes.isNotEmpty()
-                val minFocusDist = chars.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE) ?: 0f
-
-                sb.appendLine("Camera $cameraId ($facing): AF=$hasAF, " +
-                    "minFocusDist=${String.format("%.1f", minFocusDist)}D " +
-                    "(min ${if (minFocusDist > 0) String.format("%.1f", 100.0/minFocusDist) else "N/A"} cm)")
+                val minFD = chars.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE) ?: 0f
+                sb.appendLine("Camera $cameraId ($facing): minFocusDist=${String.format("%.1f", minFD)}D")
             }
-
-            Log.d(TAG, "Cameras:\n$sb")
             promise.resolve(sb.toString())
-        } catch (e: Exception) {
-            promise.reject("ERROR", e.message)
-        }
+        } catch (e: Exception) { promise.reject("ERROR", e.message) }
     }
 
     /**
-     * Measure distance with high accuracy using multiple AF cycles.
-     *
-     * Flow:
-     * 1. Open rear camera
-     * 2. Run 3 AF cycles:
-     *    - Trigger AF_TRIGGER_START
-     *    - Wait for FOCUSED_LOCKED
-     *    - Collect 10 LENS_FOCUS_DISTANCE readings
-     *    - Trigger AF_TRIGGER_CANCEL to reset
-     * 3. Trim outliers, average, apply calibration
-     * 4. Validate distance <= 5 feet
+     * Apply piecewise linear calibration using the lookup table.
+     * Interpolates between known calibration points.
      */
+    private fun calibrate(rawDistanceM: Double): Double {
+        val table = CALIBRATION_TABLE
+
+        // Below minimum calibration point — extrapolate using first segment
+        if (rawDistanceM <= table.first().first) {
+            val (r0, a0) = table[0]
+            val (r1, a1) = table[1]
+            val slope = (a1 - a0) / (r1 - r0)
+            return a0 + slope * (rawDistanceM - r0)
+        }
+
+        // Above maximum calibration point — extrapolate using last segment
+        if (rawDistanceM >= table.last().first) {
+            val (r0, a0) = table[table.size - 2]
+            val (r1, a1) = table[table.size - 1]
+            val slope = (a1 - a0) / (r1 - r0)
+            return a1 + slope * (rawDistanceM - r1)
+        }
+
+        // Interpolate between two surrounding points
+        for (i in 0 until table.size - 1) {
+            val (r0, a0) = table[i]
+            val (r1, a1) = table[i + 1]
+            if (rawDistanceM in r0..r1) {
+                val t = (rawDistanceM - r0) / (r1 - r0)
+                return a0 + t * (a1 - a0)
+            }
+        }
+
+        // Fallback (shouldn't reach here)
+        return rawDistanceM
+    }
+
     @ReactMethod
     fun measureDepth(promise: Promise) {
         Thread {
@@ -112,9 +140,8 @@ class ArCoreDepthModule(reactContext: ReactApplicationContext) :
                 }
 
                 val chars = cameraManager.getCameraCharacteristics(cameraId)
-                Log.d(TAG, "=== measureDepth START (camera $cameraId) ===")
+                Log.d(TAG, "=== measureDepth START ===")
 
-                // Setup
                 handlerThread = HandlerThread("FocusThread").also { it.start() }
                 val handler = Handler(handlerThread.looper)
 
@@ -130,12 +157,12 @@ class ArCoreDepthModule(reactContext: ReactApplicationContext) :
                 val cameraError = AtomicReference<String?>(null)
 
                 cameraManager.openCamera(cameraId, object : CameraDevice.StateCallback() {
-                    override fun onOpened(camera: CameraDevice) { cameraRef.set(camera); cameraLatch.countDown() }
-                    override fun onDisconnected(camera: CameraDevice) { cameraError.set("disconnected"); cameraLatch.countDown() }
-                    override fun onError(camera: CameraDevice, error: Int) { cameraError.set("error $error"); cameraLatch.countDown() }
+                    override fun onOpened(cam: CameraDevice) { cameraRef.set(cam); cameraLatch.countDown() }
+                    override fun onDisconnected(cam: CameraDevice) { cameraError.set("disconnected"); cameraLatch.countDown() }
+                    override fun onError(cam: CameraDevice, err: Int) { cameraError.set("error $err"); cameraLatch.countDown() }
                 }, handler)
 
-                if (!cameraLatch.await(10, TimeUnit.SECONDS)) {
+                if (!cameraLatch.await(8, TimeUnit.SECONDS)) {
                     promise.reject("TIMEOUT", "Camera open timeout"); return@Thread
                 }
                 cameraDevice = cameraRef.get()
@@ -143,7 +170,7 @@ class ArCoreDepthModule(reactContext: ReactApplicationContext) :
                     promise.reject("ERROR", "Camera: ${cameraError.get()}"); return@Thread
                 }
 
-                // Create session
+                // Session
                 val sessionLatch = CountDownLatch(1)
                 val sessionRef = AtomicReference<CameraCaptureSession?>(null)
 
@@ -155,7 +182,7 @@ class ArCoreDepthModule(reactContext: ReactApplicationContext) :
                     }, handler
                 )
 
-                if (!sessionLatch.await(10, TimeUnit.SECONDS)) {
+                if (!sessionLatch.await(8, TimeUnit.SECONDS)) {
                     promise.reject("TIMEOUT", "Session timeout"); return@Thread
                 }
                 captureSession = sessionRef.get()
@@ -163,48 +190,47 @@ class ArCoreDepthModule(reactContext: ReactApplicationContext) :
                     promise.reject("ERROR", "Session failed"); return@Thread
                 }
 
-                // === MULTIPLE AF CYCLES ===
+                // === FAST AF CYCLES ===
                 val allReadings = mutableListOf<Float>()
 
                 for (cycle in 1..AF_CYCLES) {
-                    Log.d(TAG, "--- AF Cycle $cycle/$AF_CYCLES ---")
+                    Log.d(TAG, "--- AF Cycle $cycle ---")
 
                     // Trigger AF
-                    val triggerRequest = cameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
+                    val triggerReq = cameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
                         addTarget(imageReader.surface)
                         set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_AUTO)
                         set(CaptureRequest.CONTROL_AF_TRIGGER, CaptureRequest.CONTROL_AF_TRIGGER_START)
                     }.build()
-                    captureSession.capture(triggerRequest, null, handler)
+                    captureSession.capture(triggerReq, null, handler)
 
-                    // Wait for AF to lock
-                    Thread.sleep(1500)
+                    // Wait for AF lock (reduced from 1.5s)
+                    Thread.sleep(1000)
 
-                    // Collect readings
+                    // Read distances
                     val cycleReadings = mutableListOf<Float>()
                     val cycleLatch = CountDownLatch(READINGS_PER_CYCLE)
 
-                    val readRequest = cameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
+                    val readReq = cameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
                         addTarget(imageReader.surface)
                         set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_AUTO)
                     }.build()
 
-                    captureSession.setRepeatingRequest(readRequest, object : CameraCaptureSession.CaptureCallback() {
+                    captureSession.setRepeatingRequest(readReq, object : CameraCaptureSession.CaptureCallback() {
                         override fun onCaptureCompleted(
                             session: CameraCaptureSession, request: CaptureRequest, result: TotalCaptureResult
                         ) {
                             val dist = result.get(CaptureResult.LENS_FOCUS_DISTANCE) ?: return
-                            val afState = result.get(CaptureResult.CONTROL_AF_STATE) ?: return
-
                             if (dist > 0) {
                                 synchronized(cycleReadings) {
                                     if (cycleReadings.size < READINGS_PER_CYCLE) {
                                         cycleReadings.add(dist)
-                                        Log.d(TAG, "  Reading ${cycleReadings.size}: " +
-                                            "${String.format("%.3f", dist)}D = " +
-                                            "${String.format("%.4f", 1.0/dist)}m raw, " +
-                                            "${String.format("%.4f", CALIBRATION_FACTOR/dist)}m cal " +
-                                            "(AF=$afState)")
+                                        val rawM = 1.0 / dist
+                                        val calM = calibrate(rawM)
+                                        Log.d(TAG, "  [${cycleReadings.size}] ${String.format("%.3f", dist)}D " +
+                                            "raw=${String.format("%.3f", rawM)}m " +
+                                            "cal=${String.format("%.3f", calM)}m " +
+                                            "(${String.format("%.1f", calM * 3.281)}ft)")
                                         cycleLatch.countDown()
                                     }
                                 }
@@ -212,23 +238,20 @@ class ArCoreDepthModule(reactContext: ReactApplicationContext) :
                         }
                     }, handler)
 
-                    cycleLatch.await(8, TimeUnit.SECONDS)
+                    cycleLatch.await(5, TimeUnit.SECONDS)
                     try { captureSession.stopRepeating() } catch (_: Exception) {}
 
-                    synchronized(cycleReadings) {
-                        allReadings.addAll(cycleReadings)
-                        Log.d(TAG, "Cycle $cycle: got ${cycleReadings.size} readings")
-                    }
+                    synchronized(cycleReadings) { allReadings.addAll(cycleReadings) }
 
-                    // Cancel AF to allow re-trigger
+                    // Cancel AF for next cycle
                     if (cycle < AF_CYCLES) {
-                        val cancelRequest = cameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
+                        val cancelReq = cameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
                             addTarget(imageReader.surface)
                             set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_AUTO)
                             set(CaptureRequest.CONTROL_AF_TRIGGER, CaptureRequest.CONTROL_AF_TRIGGER_CANCEL)
                         }.build()
-                        captureSession.capture(cancelRequest, null, handler)
-                        Thread.sleep(500) // Brief pause before next cycle
+                        captureSession.capture(cancelReq, null, handler)
+                        Thread.sleep(300)
                     }
                 }
 
@@ -237,35 +260,32 @@ class ArCoreDepthModule(reactContext: ReactApplicationContext) :
                     return@Thread
                 }
 
-                // Process: trim outliers, average, calibrate
+                // Process readings
                 allReadings.sort()
 
-                // Keep middle 60%
+                // Trim outliers (keep middle 60%)
                 val trimCount = allReadings.size / 5
                 val trimmed = if (allReadings.size > 5) {
                     allReadings.subList(trimCount, allReadings.size - trimCount)
-                } else {
-                    allReadings
-                }
+                } else { allReadings }
 
-                // Average diopters
+                // Average raw diopters → raw distance → calibrate
                 val avgDiopters = trimmed.map { it.toDouble() }.average()
                 val rawDistanceM = 1.0 / avgDiopters
-                val calibratedDistanceM = rawDistanceM * CALIBRATION_FACTOR
+                val calibratedDistanceM = calibrate(rawDistanceM)
 
-                // Min/max (in calibrated meters)
-                val maxDiopters = trimmed.first().toDouble()  // smallest diopter = farthest
-                val minDiopters = trimmed.last().toDouble()   // largest diopter = closest
-                val minDistM = CALIBRATION_FACTOR / minDiopters
-                val maxDistM = CALIBRATION_FACTOR / maxDiopters
+                // Min/max calibrated
+                val maxDiopters = trimmed.first().toDouble()
+                val minDiopters = trimmed.last().toDouble()
+                val minDistM = calibrate(1.0 / minDiopters)
+                val maxDistM = calibrate(1.0 / maxDiopters)
+
+                val tooFar = calibratedDistanceM > MAX_DISTANCE_M
 
                 Log.d(TAG, "=== RESULT: raw=${String.format("%.3f", rawDistanceM)}m " +
                     "calibrated=${String.format("%.3f", calibratedDistanceM)}m " +
                     "(${String.format("%.1f", calibratedDistanceM * 3.281)}ft) " +
-                    "from ${trimmed.size}/${allReadings.size} readings ===")
-
-                // Check max distance
-                val tooFar = calibratedDistanceM > MAX_DISTANCE_M
+                    "tooFar=$tooFar ===")
 
                 val result = Arguments.createMap().apply {
                     putDouble("averageDistance", calibratedDistanceM)
@@ -276,14 +296,13 @@ class ArCoreDepthModule(reactContext: ReactApplicationContext) :
                     putDouble("totalPixels", allReadings.size.toDouble())
                     putString("method", "Autofocus PDAF")
                     putBoolean("tooFar", tooFar)
-                    putDouble("calibrationFactor", CALIBRATION_FACTOR)
                 }
                 promise.resolve(result)
 
             } catch (e: SecurityException) {
                 promise.reject("NO_PERMISSION", "Camera permission required")
             } catch (e: Exception) {
-                Log.e(TAG, "measureDepth error: ${e.javaClass.simpleName}: ${e.message}", e)
+                Log.e(TAG, "measureDepth: ${e.javaClass.simpleName}: ${e.message}", e)
                 promise.reject("ERROR", "${e.javaClass.simpleName}: ${e.message}")
             } finally {
                 try { captureSession?.close() } catch (_: Exception) {}
@@ -299,11 +318,10 @@ class ArCoreDepthModule(reactContext: ReactApplicationContext) :
         for (cameraId in cameraManager.cameraIdList) {
             val chars = cameraManager.getCameraCharacteristics(cameraId)
             if (chars.get(CameraCharacteristics.LENS_FACING) != CameraCharacteristics.LENS_FACING_BACK) continue
-
             val afModes = chars.get(CameraCharacteristics.CONTROL_AF_AVAILABLE_MODES) ?: continue
             if (afModes.contains(CameraMetadata.CONTROL_AF_MODE_AUTO)) {
-                val minFocusDist = chars.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE) ?: 0f
-                if (minFocusDist > 0) return cameraId
+                val minFD = chars.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE) ?: 0f
+                if (minFD > 0) return cameraId
             }
         }
         return null
